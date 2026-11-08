@@ -1,0 +1,19 @@
+# Render blueprint for A Hand Up.
+# Deploy with: render.com blueprint sync, or `render blueprint launch`.
+# Cost: $7/mo Starter web service + 1 GB persistent disk at $0.25/GB/mo
+# = ~$7.25/mo. The disk holds the SQLite database so asks, accounts and
+# totals survive restarts and redeploys.
+services:
+  - type: web
+    name: a-hand-up
+    env: bun
+    plan: starter
+    buildCommand: bun install && bun run build
+    startCommand: bun run start
+    disk:
+      name: a-hand-up-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /var/data/app.db
