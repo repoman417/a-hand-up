@@ -1,8 +1,8 @@
 // End-to-end checks for A Hand Up.
 // Run against a booted server on a throwaway database:
 //   rm -f /tmp/test-app.db
-//   DATABASE_PATH=/tmp/test-app.db bun run dev
-//   TEST_DB=/tmp/test-app.db BASE_URL=http://localhost:3000 bun run test
+//   DATABASE_PATH=/tmp/test-app.db BOARD_TOKEN=test-board-token bun run dev
+//   TEST_DB=/tmp/test-app.db BOARD_TOKEN=test-board-token BASE_URL=http://localhost:3000 bun run test
 //
 // Uses fake bill account numbers only — never a real one.
 
@@ -10,6 +10,7 @@ import { Database } from "bun:sqlite";
 
 const BASE = process.env.BASE_URL || "http://localhost:3000";
 const TEST_DB = process.env.TEST_DB || "";
+const BOARD_TOKEN = process.env.BOARD_TOKEN || "";
 const D1 = "device-giver-one";
 const D2 = "device-giver-two";
 const D3 = "device-giver-three";
@@ -31,11 +32,12 @@ function check(name: string, cond: boolean, detail = "") {
 
 async function req(
   path: string,
-  opts: { method?: string; body?: unknown; token?: string; device?: string } = {},
+  opts: { method?: string; body?: unknown; token?: string; device?: string; board?: string } = {},
 ): Promise<{ status: number; data: any }> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (opts.token) headers["Authorization"] = `Bearer ${opts.token}`;
   if (opts.device) headers["X-Device-Token"] = opts.device;
+  if (opts.board) headers["X-Board-Token"] = opts.board;
   const res = await fetch(`${BASE}${path}`, {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
     headers,
@@ -117,9 +119,22 @@ check(
 r = await req("/api/board");
 check("locked ask leaves the board", Array.isArray(r.data.asks) && r.data.asks.length === 0);
 
-// 8 — confirm paid.
-r = await req(`/api/asks/${askA}/confirm-paid`, { device: D1, method: "POST" });
-check("confirm paid succeeds", r.status === 200, `status=${r.status}`);
+// 8 — proof of payment: the giver submits the confirmation number, then
+// the asker confirms it cleared. One-click "I paid it" is gone.
+r = await req(`/api/asks/${askA}/submit-proof`, {
+  body: { confirmation: "CONF-TEST-001" },
+  device: D1,
+  method: "POST",
+});
+check("giver submits payment proof", r.status === 200, `status=${r.status} ${JSON.stringify(r.data)}`);
+r = await req(`/api/asks/${askA}/submit-proof`, {
+  body: { confirmation: "CONF-FAKE-002" },
+  device: D3,
+  method: "POST",
+});
+check("wrong device cannot submit proof", r.status === 403, `status=${r.status}`);
+r = await req(`/api/asks/${askA}/confirm-paid`, { method: "POST", token });
+check("asker confirms payment cleared", r.status === 200, `status=${r.status}`);
 
 // 9 — proof strip counts it: 1 met, $300, state-only line.
 r = await req("/api/proof");
@@ -207,13 +222,24 @@ const askC = r.data.ask?.id as number;
 r = await req(`/api/asks/${askC}/withdraw`, { method: "POST", token });
 check("asker can withdraw their own open ask", r.status === 200, `status=${r.status}`);
 
-// 14 — wrong device cannot confirm; the claiming device can.
+// 14 — wrong device cannot submit proof; the claiming device can; then
+// the asker confirms it cleared.
 r = await req(`/api/asks/${askB}/claim`, { device: D2, method: "POST" });
 check("re-claim ask B succeeds", r.status === 200, `status=${r.status}`);
-r = await req(`/api/asks/${askB}/confirm-paid`, { device: D3, method: "POST" });
-check("wrong device cannot confirm paid", r.status === 403, `status=${r.status}`);
-r = await req(`/api/asks/${askB}/confirm-paid`, { device: D2, method: "POST" });
-check("claiming device confirms paid", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askB}/submit-proof`, {
+  body: { confirmation: "CONF-TEST-002" },
+  device: D3,
+  method: "POST",
+});
+check("wrong device cannot submit proof for B", r.status === 403, `status=${r.status}`);
+r = await req(`/api/asks/${askB}/submit-proof`, {
+  body: { confirmation: "CONF-TEST-002" },
+  device: D2,
+  method: "POST",
+});
+check("claiming device submits proof for B", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askB}/confirm-paid`, { method: "POST", token });
+check("asker confirms paid for B", r.status === 200, `status=${r.status}`);
 
 // 15 — proof strip now: 2 met, $500.
 r = await req("/api/proof");
@@ -315,6 +341,219 @@ check(
     mine.includes(`${askC}:withdrawn`),
   JSON.stringify(mine),
 );
+
+// 19 — no self-claims: the asker cannot claim their own ask.
+r = await req("/api/accounts", {
+  body: { handle: "testasker3", password: "testpass123" },
+  method: "POST",
+});
+const token3 = r.data.token as string;
+check("create third account", r.status === 201 && !!token3, JSON.stringify(r.data));
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-SELF-001",
+    amount: 50,
+    category: "Utility bill",
+    payee: "Self Test Utility",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token3,
+});
+check("post self ask succeeds", r.status === 201, JSON.stringify(r.data));
+const askSelf = r.data.ask?.id as number;
+r = await req(`/api/asks/${askSelf}/claim`, {
+  device: "device-self",
+  method: "POST",
+  token: token3,
+});
+check(
+  "self-claim blocked",
+  r.status === 403 && /isn't available/.test(r.data.error || ""),
+  JSON.stringify(r.data),
+);
+r = await req(`/api/asks/${askSelf}/claim`, {
+  device: "device-stranger",
+  method: "POST",
+});
+check("a stranger's device can claim the same ask", r.status === 200, JSON.stringify(r.data));
+
+// 20 — asker rejects a proof: the ask goes back on the board.
+r = await req(`/api/asks/${askSelf}/submit-proof`, {
+  body: { confirmation: "CONF-REJECT-1" },
+  device: "device-stranger",
+  method: "POST",
+});
+check("proof submitted for rejection test", r.status === 200, JSON.stringify(r.data));
+r = await req(`/api/asks/${askSelf}/reject-proof`, { method: "POST", token: token3 });
+check("asker rejects the proof", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/board");
+const backOn = (r.data.asks || []).find((a: any) => a.id === askSelf);
+check(
+  "rejected proof puts the ask back on the board",
+  !!backOn,
+  JSON.stringify(r.data.asks),
+);
+
+// 21 — stale-claim unlock (24h, no proof) + 30-day ask expiry.
+if (!TEST_DB) {
+  console.log("SKIP  stale-claim unlock + 30-day expiry checks (TEST_DB not set)");
+} else {
+  const sqlite = new Database(TEST_DB);
+  const nowMs = Date.now();
+  sqlite
+    .query(
+      `INSERT INTO asks (account_id, payee, category, amount_cents, account_number, state, status, created_at, claimed_at, claimed_by_device)
+       VALUES (1, 'Stale Test Utility', 'Utility bill', 1000, 'TEST-STALE-001', 'Missouri', 'locked', ?, ?, 'device-stale')`,
+    )
+    .run(nowMs - 25 * 60 * 60 * 1000, nowMs - 25 * 60 * 60 * 1000);
+  r = await req("/api/board");
+  const stale = (r.data.asks || []).find((a: any) => a.payee === "Stale Test Utility");
+  check(
+    "stale 25h claim unlocks back onto the board",
+    !!stale,
+    JSON.stringify(r.data.asks),
+  );
+  sqlite
+    .query(
+      `INSERT INTO asks (account_id, payee, category, amount_cents, account_number, state, status, created_at)
+       VALUES (1, 'Old Open Utility', 'Utility bill', 1000, 'TEST-EXP-001', 'Missouri', 'open', ?)`,
+    )
+    .run(nowMs - 31 * DAY);
+  r = await req("/api/board");
+  const expired = (r.data.asks || []).find((a: any) => a.payee === "Old Open Utility");
+  check(
+    "31-day-old open ask expires off the board",
+    !expired,
+    JSON.stringify(r.data.asks),
+  );
+  r = await req("/api/asks", {
+    body: {
+      accountNumber: "TEST-EXP-001",
+      amount: 10,
+      category: "Utility bill",
+      payee: "Old Open Utility",
+      state: "Missouri",
+    },
+    method: "POST",
+    token: token3,
+  });
+  check(
+    "re-posting an expired ask's bill succeeds",
+    r.status === 201,
+    JSON.stringify(r.data),
+  );
+}
+
+// 22 — verified need: bill photo + three board votes.
+if (!BOARD_TOKEN) {
+  console.log("SKIP  verified-need checks (BOARD_TOKEN not set)");
+} else {
+  const form = new FormData();
+  form.append("payee", "Verified Test Utility");
+  form.append("category", "Utility bill");
+  form.append("amount", "75");
+  form.append("accountNumber", "TEST-VER-001");
+  form.append("state", "Missouri");
+  form.append(
+    "needProof",
+    new Blob(["fake-image-bytes"], { type: "image/png" }),
+    "bill.png",
+  );
+  const upRes = await fetch(`${BASE}/api/asks`, {
+    body: form,
+    headers: { Authorization: `Bearer ${token3}` },
+    method: "POST",
+  });
+  const upData = await upRes.json().catch(() => ({}));
+  check(
+    "post ask with bill photo succeeds",
+    upRes.status === 201 && upData.ask?.needProofStatus === "pending",
+    JSON.stringify(upData),
+  );
+  const askV = upData.ask?.id as number;
+
+  r = await req("/api/board/review");
+  check(
+    "review queue without board token is denied",
+    r.status === 401 || r.status === 503,
+    `status=${r.status}`,
+  );
+  r = await req("/api/board/review", { board: BOARD_TOKEN });
+  check(
+    "review queue lists the pending proof",
+    r.status === 200 && (r.data.asks || []).some((a: any) => a.id === askV),
+    JSON.stringify(r.data),
+  );
+  for (const voter of ["darin", "maya"]) {
+    r = await req(`/api/board/review/${askV}/vote`, {
+      body: { vote: "approve", voter },
+      board: BOARD_TOKEN,
+      method: "POST",
+    });
+    check(`board vote ${voter} approve`, r.status === 200, JSON.stringify(r.data));
+  }
+  r = await req("/api/board/review", { board: BOARD_TOKEN });
+  check(
+    "two approvals leaves proof pending",
+    (r.data.asks || []).some((a: any) => a.id === askV),
+    JSON.stringify(r.data),
+  );
+  r = await req(`/api/board/review/${askV}/vote`, {
+    body: { vote: "approve", voter: "milo" },
+    board: BOARD_TOKEN,
+    method: "POST",
+  });
+  check(
+    "third approval verifies the need",
+    r.status === 200 && r.data.needVerified === true,
+    JSON.stringify(r.data),
+  );
+  r = await req("/api/board");
+  const v = (r.data.asks || []).find((a: any) => a.id === askV);
+  check(
+    "board shows Verified need badge",
+    v?.needVerified === true,
+    JSON.stringify(v),
+  );
+
+  // A rejection turns a proof down.
+  const form2 = new FormData();
+  form2.append("payee", "Rejected Test Utility");
+  form2.append("category", "Utility bill");
+  form2.append("amount", "40");
+  form2.append("accountNumber", "TEST-VER-002");
+  form2.append("state", "Missouri");
+  form2.append(
+    "needProof",
+    new Blob(["fake-image-bytes"], { type: "image/png" }),
+    "bill.png",
+  );
+  const upRes2 = await fetch(`${BASE}/api/asks`, {
+    body: form2,
+    headers: { Authorization: `Bearer ${token3}` },
+    method: "POST",
+  });
+  const upData2 = await upRes2.json().catch(() => ({}));
+  const askV2 = upData2.ask?.id as number;
+  check("post second ask with bill photo succeeds", upRes2.status === 201, JSON.stringify(upData2));
+  r = await req(`/api/board/review/${askV2}/vote`, {
+    body: { vote: "reject", voter: "maya" },
+    board: BOARD_TOKEN,
+    method: "POST",
+  });
+  check(
+    "one rejection turns the proof down",
+    r.status === 200 && r.data.needProofStatus === "rejected",
+    JSON.stringify(r.data),
+  );
+  r = await req("/api/board/review", { board: BOARD_TOKEN });
+  check(
+    "rejected proof leaves the review queue",
+    !(r.data.asks || []).some((a: any) => a.id === askV2),
+    JSON.stringify(r.data),
+  );
+}
 
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {

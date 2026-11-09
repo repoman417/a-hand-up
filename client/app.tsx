@@ -52,6 +52,46 @@ async function fetchJSON(path: string, opts: RequestInit = {}): Promise<any> {
   }
 }
 
+// Multipart (file upload) variant: no JSON content-type — the browser sets
+// the boundary. Auth + device headers still go along.
+async function fetchForm(path: string, form: FormData): Promise<any> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const headers: Record<string, string> = {};
+    const token = getAuthToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    headers["X-Device-Token"] = getDeviceToken();
+    const res = await fetch(path, {
+      body: form,
+      headers,
+      method: "POST",
+      signal: ctrl.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(
+        (data && data.error) || `Request failed (${res.status}).`,
+      );
+    }
+    return data;
+  } catch (e: any) {
+    if (e && e.name === "AbortError") {
+      throw new Error("The request timed out. Check your connection and try again.");
+    }
+    throw e;
+  }
+}
+
+function getBoardToken(): string | null {
+  return localStorage.getItem("ahu-board-token");
+}
+
+function setBoardToken(token: string | null) {
+  if (token) localStorage.setItem("ahu-board-token", token);
+  else localStorage.removeItem("ahu-board-token");
+}
+
 const US_STATES = [
   "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
   "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia",
@@ -107,6 +147,7 @@ type BoardAsk = {
   helpedCount: number;
   helpedLabel: string;
   createdAt: number;
+  needVerified: boolean;
 };
 
 type ProofData = {
@@ -126,6 +167,9 @@ type ClaimedAsk = {
   accountNumber: string | null;
   status: string;
   metAt: number | null;
+  proofConfirmation: string | null;
+  proofSubmittedAt: number | null;
+  hasReceipt: boolean;
 };
 
 type OwnAsk = {
@@ -140,6 +184,11 @@ type OwnAsk = {
   status: string;
   metAt: number | null;
   createdAt: number;
+  needVerified: boolean;
+  needProofStatus: string;
+  proofConfirmation: string | null;
+  proofSubmittedAt: number | null;
+  hasReceipt: boolean;
 };
 
 type MeData = {
@@ -150,7 +199,18 @@ type MeData = {
   remainingCents: number;
 };
 
-type View = "board" | "ask" | "yours" | "how";
+type View = "board" | "ask" | "yours" | "how" | "review";
+
+// Plain words for an ask's status on the asker's own page — never the raw
+// word "locked".
+function statusLabel(status: string): string {
+  if (status === "open") return "Open — on the board";
+  if (status === "locked") return "Claimed — a helper has it right now";
+  if (status === "met") return "Met — thank you";
+  if (status === "withdrawn") return "Withdrawn";
+  if (status === "expired") return "Expired — off the board after 30 days";
+  return status;
+}
 
 // ---------------------------------------------------------------------------
 // Shared bits
@@ -161,6 +221,138 @@ function LoadError({ message, onRetry }: { message: string; onRetry: () => void 
     <div className="card">
       <div className="error">{message}</div>
       <button className="btn" onClick={onRetry}>Try again</button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Payment proof form (giver side) — shared by the board and Yours views
+// ---------------------------------------------------------------------------
+
+function ProofForm({ askId, onSubmitted, onError }: {
+  askId: number;
+  onSubmitted: () => void;
+  onError: (msg: string) => void;
+}) {
+  const [confirmation, setConfirmation] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const form = new FormData();
+      form.append("confirmation", confirmation);
+      if (file) form.append("receipt", file);
+      await fetchForm(`/api/asks/${askId}/submit-proof`, form);
+      onSubmitted();
+    } catch (err: any) {
+      onError(err.message || "Could not send the proof.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <label>
+        Payment confirmation number
+        <input
+          value={confirmation}
+          onChange={(e) => setConfirmation(e.target.value)}
+          placeholder="The confirmation number from the payee"
+          autoComplete="off"
+        />
+      </label>
+      <label>
+        Receipt photo <span className="hint">(optional — helps the asker check it)</span>
+        <input
+          type="file"
+          accept="image/*"
+          onChange={(e) => setFile(e.target.files?.[0] || null)}
+        />
+      </label>
+      <div className="btn-row">
+        <button className="btn" type="submit" disabled={busy || !confirmation.trim()}>
+          {busy ? "Sending…" : "Send payment proof"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// A claimed ask on the giver side: pay details, proof form, cancel.
+function GiverClaimCard({ ask, onReleased, onProofSubmitted, onError }: {
+  ask: ClaimedAsk;
+  onReleased: () => void;
+  onProofSubmitted: () => void;
+  onError: (msg: string) => void;
+}) {
+  async function release() {
+    try {
+      await fetchJSON(`/api/asks/${ask.id}/release`, { method: "POST" });
+      onReleased();
+    } catch (e: any) {
+      onError(e.message || "Could not release this ask.");
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="ask-head">
+        <h3>{ask.payee}</h3>
+        <span className="amount">{money(ask.amount)}</span>
+      </div>
+      <p className="meta">
+        {ask.category} — {ask.state}
+        {ask.dueDate ? ` — due ${fmtDate(ask.dueDate)}` : ""}
+        {ask.cutoffDate ? ` — cutoff ${fmtDate(ask.cutoffDate)}` : ""}
+      </p>
+      <p>
+        Status:{" "}
+        <span className={`status ${ask.status}`}>
+          {ask.status === "locked"
+            ? "Claimed — waiting on your payment"
+            : "Met — thank you"}
+        </span>
+      </p>
+      {ask.status === "locked" && ask.accountNumber && (
+        <div className="pay-box">
+          <p style={{ marginTop: 0 }}>
+            Pay the payee directly using this account number:
+          </p>
+          <p>
+            Account number: <code>{ask.accountNumber}</code>
+          </p>
+          <p>
+            No cash goes to the asker, ever. Once you&rsquo;ve paid, send the
+            confirmation number below so the asker can check it with the
+            payee — that&rsquo;s what takes the ask off the board.
+          </p>
+        </div>
+      )}
+      {ask.status === "locked" && (
+        <>
+          {ask.proofConfirmation ? (
+            <div className="notice">
+              Proof sent — confirmation <code>{ask.proofConfirmation}</code>.
+              Waiting for the asker to confirm it cleared with the payee.
+            </div>
+          ) : (
+            <ProofForm
+              askId={ask.id}
+              onSubmitted={onProofSubmitted}
+              onError={onError}
+            />
+          )}
+          <div className="btn-row">
+            <button className="btn secondary" onClick={release}>
+              Cancel this claim
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -202,41 +394,22 @@ function BoardView({ onClaimed }: { onClaimed: () => void }) {
       const data = await fetchJSON(`/api/asks/${ask.id}/claim`, {
         method: "POST",
       });
-      setClaimed((prev) => ({ ...prev, [ask.id]: data.ask }));
+      setClaimed((prev) => ({
+        ...prev,
+        [ask.id]: {
+          ...data.ask,
+          hasReceipt: false,
+          proofConfirmation: null,
+          proofSubmittedAt: null,
+          status: "locked",
+        },
+      }));
       setAsks((prev) => (prev || []).filter((a) => a.id !== ask.id));
       onClaimed();
     } catch (e: any) {
       setClaimError(e.message || "Could not claim this ask.");
     } finally {
       setClaimingId(null);
-    }
-  }
-
-  async function confirmPaid(askId: number) {
-    try {
-      await fetchJSON(`/api/asks/${askId}/confirm-paid`, { method: "POST" });
-      setClaimed((prev) => {
-        const next = { ...prev };
-        delete next[askId];
-        return next;
-      });
-      await load();
-    } catch (e: any) {
-      setClaimError(e.message || "Could not confirm the payment.");
-    }
-  }
-
-  async function release(askId: number) {
-    try {
-      await fetchJSON(`/api/asks/${askId}/release`, { method: "POST" });
-      setClaimed((prev) => {
-        const next = { ...prev };
-        delete next[askId];
-        return next;
-      });
-      await load();
-    } catch (e: any) {
-      setClaimError(e.message || "Could not release this ask.");
     }
   }
 
@@ -263,40 +436,41 @@ function BoardView({ onClaimed }: { onClaimed: () => void }) {
             ))}
           </ul>
         )}
+        <p className="cap-note">
+          Up to $500 in help every 30 days, so more neighbors can get
+          support — and when you&rsquo;re able, you can help the next person.
+        </p>
+        <p className="cap-note">
+          Help isn&rsquo;t guaranteed — it depends on a neighbor choosing to
+          give. You may get nothing, and that&rsquo;s okay.
+        </p>
       </div>
 
       {claimError && <div className="error">{claimError}</div>}
 
       {Object.entries(claimed).map(([id, ask]) => (
-        <div className="card" key={`claimed-${id}`}>
-          <h3>You&rsquo;re helping: {ask.payee}</h3>
-          <p className="meta">
-            {ask.category} — {money(ask.amount)} — {ask.state}
-            {ask.dueDate ? ` — due ${fmtDate(ask.dueDate)}` : ""}
-            {ask.cutoffDate ? ` — cutoff ${fmtDate(ask.cutoffDate)}` : ""}
-          </p>
-          <div className="pay-box">
-            <p style={{ marginTop: 0 }}>
-              Pay the bill directly at the payee — their website, app, phone,
-              or in person. Use this account number:
-            </p>
-            <p>
-              Account number: <code>{ask.accountNumber}</code>
-            </p>
-            <p>
-              No cash goes to the asker, ever. Once you&rsquo;ve paid, come
-              back here and confirm so the ask leaves the board for good.
-            </p>
-          </div>
-          <div className="btn-row">
-            <button className="btn" onClick={() => confirmPaid(ask.id)}>
-              I paid it
-            </button>
-            <button className="btn secondary" onClick={() => release(ask.id)}>
-              Payment didn&rsquo;t go through
-            </button>
-          </div>
-        </div>
+        <GiverClaimCard
+          key={`claimed-${id}`}
+          ask={ask}
+          onReleased={() => {
+            setClaimed((prev) => {
+              const next = { ...prev };
+              delete next[Number(id)];
+              return next;
+            });
+            load();
+          }}
+          onProofSubmitted={() => {
+            setClaimed((prev) => ({
+              ...prev,
+              [Number(id)]: {
+                ...(prev as any)[Number(id)],
+                proofConfirmation: "sent",
+              },
+            }));
+          }}
+          onError={(msg) => setClaimError(msg)}
+        />
       ))}
 
       {asks.length === 0 && Object.keys(claimed).length === 0 && (
@@ -315,6 +489,9 @@ function BoardView({ onClaimed }: { onClaimed: () => void }) {
             {ask.cutoffDate ? ` — cutoff ${fmtDate(ask.cutoffDate)}` : ""}
           </p>
           <span className="badge">{ask.helpedLabel}</span>
+          {ask.needVerified && (
+            <span className="badge verified">Verified need</span>
+          )}
           <div className="btn-row">
             <button
               className="btn"
@@ -427,6 +604,7 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
   const [state, setState] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [cutoffDate, setCutoffDate] = useState("");
+  const [needProof, setNeedProof] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -439,18 +617,31 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
     setDone(false);
     setBusy(true);
     try {
-      await fetchJSON("/api/asks", {
-        body: JSON.stringify({
-          accountNumber,
-          amount: Number(amount),
-          category,
-          cutoffDate: cutoffDate || null,
-          dueDate: dueDate || null,
-          payee,
-          state,
-        }),
-        method: "POST",
-      });
+      if (needProof) {
+        const form = new FormData();
+        form.append("payee", payee);
+        form.append("category", category);
+        form.append("amount", amount);
+        form.append("accountNumber", accountNumber);
+        form.append("state", state);
+        form.append("dueDate", dueDate || "");
+        form.append("cutoffDate", cutoffDate || "");
+        form.append("needProof", needProof);
+        await fetchForm("/api/asks", form);
+      } else {
+        await fetchJSON("/api/asks", {
+          body: JSON.stringify({
+            accountNumber,
+            amount: Number(amount),
+            category,
+            cutoffDate: cutoffDate || null,
+            dueDate: dueDate || null,
+            payee,
+            state,
+          }),
+          method: "POST",
+        });
+      }
       setDone(true);
       setPayee("");
       setAmount("");
@@ -458,6 +649,7 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
       setState("");
       setDueDate("");
       setCutoffDate("");
+      setNeedProof(null);
     } catch (err: any) {
       setError(err.message || "Could not post your ask.");
     } finally {
@@ -553,6 +745,20 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
               onChange={(e) => setCutoffDate(e.target.value)}
             />
           </label>
+          <label>
+            Photo of the bill <span className="hint">(optional — only the board sees it, never public)</span>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => setNeedProof(e.target.files?.[0] || null)}
+            />
+          </label>
+          <p className="hint">
+            If you attach a bill photo, cover or blur your name and address
+            first — just the payee and the amount need to show. The board
+            checks it and marks your ask &ldquo;Verified need&rdquo; when it
+            all lines up.
+          </p>
           {error && <div className="error">{error}</div>}
           {done && (
             <div className="notice">
@@ -569,6 +775,57 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
         </form>
       </div>
     </div>
+  );
+}
+
+// Image served behind an access check: fetched with the same auth and
+// device headers as the API, then shown from a blob URL.
+function AuthedImage({ src, alt, blurred, extraHeaders }: {
+  src: string;
+  alt: string;
+  blurred?: boolean;
+  extraHeaders?: Record<string, string>;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let objectUrl: string | null = null;
+    let alive = true;
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const headers: Record<string, string> = {};
+        const token = getAuthToken();
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        headers["X-Device-Token"] = getDeviceToken();
+        Object.assign(headers, extraHeaders || {});
+        const res = await fetch(src, { headers, signal: ctrl.signal });
+        if (!res.ok) throw new Error("load failed");
+        const blob = await res.blob();
+        if (alive) {
+          objectUrl = URL.createObjectURL(blob);
+          setUrl(objectUrl);
+        }
+      } catch {
+        if (alive) setFailed(true);
+      }
+    })();
+    return () => {
+      alive = false;
+      ctrl.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [src]);
+
+  if (failed) return <p className="hint">Image could not be loaded.</p>;
+  if (!url) return <p className="hint">Loading image…</p>;
+  return (
+    <img
+      src={url}
+      alt={alt}
+      style={blurred ? { filter: "blur(6px)", maxWidth: "100%" } : { maxWidth: "100%" }}
+    />
   );
 }
 
@@ -597,7 +854,8 @@ function YoursView({ me }: { me: MeData | null }) {
     load();
   }, [load]);
 
-  async function confirmPaid(id: number) {
+  // The asker confirms the giver's proof cleared with the payee.
+  async function askerConfirm(id: number) {
     try {
       await fetchJSON(`/api/asks/${id}/confirm-paid`, { method: "POST" });
       setNotice("Thank you — that need is met, and the ask is off the board for good.");
@@ -607,13 +865,14 @@ function YoursView({ me }: { me: MeData | null }) {
     }
   }
 
-  async function release(id: number) {
+  // The asker says the proof did not clear: the ask goes back on the board.
+  async function rejectProof(id: number) {
     try {
-      await fetchJSON(`/api/asks/${id}/release`, { method: "POST" });
-      setNotice("Released — the ask is back on the board for someone else to help with.");
+      await fetchJSON(`/api/asks/${id}/reject-proof`, { method: "POST" });
+      setNotice("That proof didn't clear — the ask is back on the board for someone else to help with.");
       await load();
     } catch (e: any) {
-      setError(e.message || "Could not release this ask.");
+      setError(e.message || "Could not reject the proof.");
     }
   }
 
@@ -641,45 +900,16 @@ function YoursView({ me }: { me: MeData | null }) {
         </div>
       ) : (
         claimed.map((ask) => (
-          <div className="card" key={ask.id}>
-            <div className="ask-head">
-              <h3>{ask.payee}</h3>
-              <span className="amount">{money(ask.amount)}</span>
-            </div>
-            <p className="meta">
-              {ask.category} — {ask.state}
-              {ask.dueDate ? ` — due ${fmtDate(ask.dueDate)}` : ""}
-              {ask.cutoffDate ? ` — cutoff ${fmtDate(ask.cutoffDate)}` : ""}
-            </p>
-            <p>
-              Status:{" "}
-              <span className={`status ${ask.status}`}>
-                {ask.status === "locked"
-                  ? "Claimed — waiting on your payment"
-                  : "Met — thank you"}
-              </span>
-            </p>
-            {ask.status === "locked" && ask.accountNumber && (
-              <div className="pay-box">
-                <p style={{ marginTop: 0 }}>
-                  Pay the payee directly using this account number:
-                </p>
-                <p>
-                  Account number: <code>{ask.accountNumber}</code>
-                </p>
-              </div>
-            )}
-            {ask.status === "locked" && (
-              <div className="btn-row">
-                <button className="btn" onClick={() => confirmPaid(ask.id)}>
-                  I paid it
-                </button>
-                <button className="btn secondary" onClick={() => release(ask.id)}>
-                  Payment didn&rsquo;t go through
-                </button>
-              </div>
-            )}
-          </div>
+          <GiverClaimCard
+            key={ask.id}
+            ask={ask}
+            onReleased={() => {
+              setNotice("Released — the ask is back on the board for someone else to help with.");
+              load();
+            }}
+            onProofSubmitted={() => load()}
+            onError={(msg) => setError(msg)}
+          />
         ))
       )}
 
@@ -703,9 +933,39 @@ function YoursView({ me }: { me: MeData | null }) {
               {ask.cutoffDate ? ` — cutoff ${fmtDate(ask.cutoffDate)}` : ""}
             </p>
             <p>
-              Status: <span className={`status ${ask.status}`}>{ask.status}</span>
+              Status: <span className={`status ${ask.status}`}>{statusLabel(ask.status)}</span>
               {" — "}account number: <code>{ask.accountNumber}</code>
             </p>
+            {ask.needVerified && (
+              <p><span className="badge verified">Verified need</span></p>
+            )}
+            {ask.status === "locked" && ask.proofConfirmation && (
+              <div className="pay-box">
+                <p style={{ marginTop: 0 }}>
+                  Payment proof sent — confirmation number:{" "}
+                  <code>{ask.proofConfirmation}</code>
+                </p>
+                <p>
+                  Check that number with the payee. If it cleared, confirm
+                  it below and the ask comes off the board for good.
+                </p>
+                {ask.hasReceipt && (
+                  <AuthedImage
+                    src={`/api/asks/${ask.id}/receipt`}
+                    alt="Payment receipt (blurred)"
+                    blurred
+                  />
+                )}
+                <div className="btn-row">
+                  <button className="btn" onClick={() => askerConfirm(ask.id)}>
+                    Confirm it cleared
+                  </button>
+                  <button className="btn secondary" onClick={() => rejectProof(ask.id)}>
+                    That didn&rsquo;t clear
+                  </button>
+                </div>
+              </div>
+            )}
             {ask.status === "open" && (
               <div className="btn-row">
                 <button className="btn danger" onClick={() => withdraw(ask.id)}>
@@ -716,6 +976,150 @@ function YoursView({ me }: { me: MeData | null }) {
           </div>
         ))
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Board review — verified need (Fix 1)
+// ---------------------------------------------------------------------------
+
+type ReviewAsk = {
+  id: number;
+  payee: string;
+  category: string;
+  amount: number;
+  state: string;
+  createdAt: number;
+  needProofStatus: string;
+  needVerified: boolean;
+  votes: { voter: string; vote: string }[];
+};
+
+function ReviewView() {
+  const [token, setToken] = useState(getBoardToken() || "");
+  const [asks, setAsks] = useState<ReviewAsk[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [voter, setVoter] = useState("darin");
+
+  async function boardFetch(path: string, opts: RequestInit = {}): Promise<any> {
+    const headers: Record<string, string> = {
+      "X-Board-Token": token,
+      "X-Device-Token": getDeviceToken(),
+      ...(opts.headers as Record<string, string> | undefined),
+    };
+    if (opts.body && typeof opts.body === "string") {
+      headers["Content-Type"] = "application/json";
+    }
+    const res = await fetch(path, { ...opts, headers });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Request failed (${res.status}).`);
+    return data;
+  }
+
+  async function load() {
+    setError(null);
+    setNotice(null);
+    try {
+      const data = await boardFetch("/api/board/review");
+      setAsks(data.asks);
+    } catch (e: any) {
+      setError(e.message || "Could not load the review queue.");
+      setAsks(null);
+    }
+  }
+
+  async function vote(askId: number, vote: "approve" | "reject") {
+    setError(null);
+    try {
+      const data = await boardFetch(`/api/board/review/${askId}/vote`, {
+        body: JSON.stringify({ vote, voter }),
+        method: "POST",
+      });
+      setNotice(
+        data.needVerified
+          ? "All three agreed — that ask is now marked Verified need."
+          : data.needProofStatus === "rejected"
+            ? "Rejected — that proof will not be marked verified."
+            : "Vote recorded.",
+      );
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not record the vote.");
+    }
+  }
+
+  function saveToken() {
+    setBoardToken(token || null);
+    load();
+  }
+
+  return (
+    <div>
+      <div className="card">
+        <h2>Board review</h2>
+        <p>
+          Bill photos attached to asks, for the board — Darin, Maya, and
+          Milo. All three vote on each one: the amount matches, no personal
+          info shows, and it&rsquo;s an allowed bill type. All three
+          approvals mark the ask &ldquo;Verified need&rdquo;; any rejection
+          turns it down.
+        </p>
+        <label>
+          Board token
+          <input
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="Paste the board token"
+            autoComplete="off"
+          />
+        </label>
+        <div className="btn-row">
+          <button className="btn" onClick={saveToken}>Load the queue</button>
+        </div>
+        {error && <div className="error">{error}</div>}
+        {notice && <div className="notice">{notice}</div>}
+      </div>
+      {asks && asks.length === 0 && (
+        <div className="card empty">Nothing waiting for review.</div>
+      )}
+      {asks && asks.map((ask) => (
+        <div className="card" key={ask.id}>
+          <div className="ask-head">
+            <h3>{ask.payee}</h3>
+            <span className="amount">{money(ask.amount)}</span>
+          </div>
+          <p className="meta">{ask.category} — {ask.state}</p>
+          <AuthedImage
+            src={`/api/asks/${ask.id}/need-proof`}
+            alt="Bill photo for review"
+            extraHeaders={{ "X-Board-Token": token }}
+          />
+          <p>
+            Votes:{" "}
+            {ask.votes.length === 0
+              ? "none yet"
+              : ask.votes.map((v) => `${v.voter}: ${v.vote}`).join(", ")}
+          </p>
+          <label>
+            Voting as
+            <select value={voter} onChange={(e) => setVoter(e.target.value)}>
+              <option value="darin">Darin</option>
+              <option value="maya">Maya</option>
+              <option value="milo">Milo</option>
+            </select>
+          </label>
+          <div className="btn-row">
+            <button className="btn" onClick={() => vote(ask.id, "approve")}>
+              Approve
+            </button>
+            <button className="btn secondary" onClick={() => vote(ask.id, "reject")}>
+              Reject
+            </button>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -751,16 +1155,33 @@ function HowView() {
           anybody anything once a bill is paid.
         </li>
         <li>
-          <strong>A fulfilled ask disappears.</strong> Once a bill is paid,
-          the ask leaves the board, so many givers cannot pay the same bill.
-          If you cover your own need first, take your ask down — and if a
-          giver pays it anyway, it just lands as a credit on the next bill.
+          <strong>A fulfilled ask disappears.</strong> Once a bill is paid
+          and the asker confirms the payment&rsquo;s confirmation number
+          with the payee, the ask leaves the board, so many givers cannot
+          pay the same bill. If you cover your own need first, take your
+          ask down — and if a giver pays it anyway, it just lands as a
+          credit on the next bill.
         </li>
         <li>
-          <strong>Verification is the payment itself.</strong> The money
-          went to the actual utility or vendor — that is the proof. Any place
-          that does not allow third-party payments simply cannot be used
-          here.
+          <strong>Verification is the payment itself, with proof.</strong>
+          The giver sends the payment&rsquo;s confirmation number — and a
+          receipt photo if they have one. The asker checks that number with
+          the payee and confirms it cleared. No proof, no &ldquo;paid.&rdquo;
+          A claim with no proof unlocks after about a day, so someone else
+          can try. Any place that does not allow third-party payments
+          simply cannot be used here.
+        </li>
+        <li>
+          <strong>Verified need.</strong> An asker can attach a photo of
+          the bill — name and address covered first, just the payee and
+          the amount showing. The board — Darin, Maya, and Milo, all three
+          voting — checks it and marks the ask &ldquo;Verified
+          need&rdquo; when the amount matches and nothing personal shows.
+        </li>
+        <li>
+          <strong>Asks live for 30 days.</strong> An ask stays on the board
+          for 30 days, even past its due date — a late payment still helps
+          the next bill. After 30 days it expires off the board.
         </li>
         <li>
           <strong>Free for the asker, always.</strong> It might help you get
@@ -793,9 +1214,11 @@ function HowView() {
       <p>
         This version does one thing, and it does it right now: direct giving.
         You pick a bill, you pay it straight to the people who sent it, and
-        the payment itself is the proof that somebody was helped. It
-        doesn&rsquo;t need a lawyer, a board, or a bank account to work —
-        because the platform never touches the money at all.
+        the payment itself — with the confirmation number to prove it — is
+        the proof that somebody was helped. It doesn&rsquo;t need a lawyer
+        or a bank account to work — because the platform never touches the
+        money at all. A small board — Darin, Maya, and Milo — checks bill
+        photos and payment proofs.
       </p>
       <p>
         The need is now. People are choosing between the light bill and
@@ -888,6 +1311,12 @@ function App() {
           >
             How it works
           </button>
+          <button
+            className={view === "review" ? "active" : ""}
+            onClick={() => setView("review")}
+          >
+            Board review
+          </button>
           {me && (
             <button className="right" onClick={signOut}>
               Sign out ({me.handle})
@@ -905,6 +1334,7 @@ function App() {
         {view === "ask" && <AskView me={me} onAuthed={setMe} />}
         {view === "yours" && <YoursView me={me} />}
         {view === "how" && <HowView />}
+        {view === "review" && <ReviewView />}
       </main>
       <footer>
         Free for the asker, always. It might help you get a need met, it

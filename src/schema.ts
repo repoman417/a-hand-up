@@ -11,10 +11,17 @@ export const accounts = sqliteTable("accounts", {
   passwordHash: text("password_hash").notNull(),
 });
 
-// Asks. status: open | locked | met | withdrawn.
+// Asks. status: open | locked | met | withdrawn | expired.
 // The bill account number is stored here and is NEVER included in a public
 // payload — it is shown only to the asker (their own ask) and to the giver
 // who claimed the ask.
+// Proof of payment (Fix 2): the giver submits a confirmation number and
+// optionally a receipt image. proofConfirmation is shown to the asker, who
+// confirms it cleared with the payee. The receipt image is shown blurred
+// to the asker; the confirmation number is the readable part.
+// Verified need (Fix 1): the asker may attach a bill photo (needProofPath)
+// visible only to the board. needProofStatus: none | pending | verified |
+// rejected. needVerified is set when all three board members approve.
 export const asks = sqliteTable("asks", {
   accountId: integer("account_id").notNull(),
   accountNumber: text("account_number").notNull(),
@@ -27,9 +34,26 @@ export const asks = sqliteTable("asks", {
   dueDate: text("due_date"),
   id: integer("id").primaryKey({ autoIncrement: true }),
   metAt: integer("met_at"),
+  needProofPath: text("need_proof_path"),
+  needProofStatus: text("need_proof_status").notNull().default("none"),
+  needVerified: integer("need_verified").notNull().default(0),
   payee: text("payee").notNull(),
+  proofConfirmation: text("proof_confirmation"),
+  proofReceiptPath: text("proof_receipt_path"),
+  proofSubmittedAt: integer("proof_submitted_at"),
   state: text("state").notNull(),
   status: text("status").notNull().default("open"),
+});
+
+// Board votes on verified need. One row per (ask, voter). Voters are the
+// three board members: darin, maya, milo. Vote: approve | reject. All
+// three must approve before the verified-need flag goes on; any reject
+// marks the proof rejected.
+export const needVotes = sqliteTable("need_votes", {
+  askId: integer("ask_id").notNull(),
+  createdAt: integer("created_at").notNull(),
+  vote: text("vote").notNull(),
+  voter: text("voter").notNull(),
 });
 
 // Sessions for signed-in askers. Token is a random UUID handed to the

@@ -1,8 +1,8 @@
 import { and, desc, eq, sql } from "drizzle-orm";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { db } from "./db";
-import { accounts, asks, sessions } from "./schema";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { extname, join } from "node:path";
+import { db, UPLOAD_DIR } from "./db";
+import { accounts, asks, needVotes, sessions } from "./schema";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -13,6 +13,23 @@ const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const CAP_CENTS = 50000; // $500 rolling total per asker per 30 days
 const MIN_AMOUNT_CENTS = 500; // $5
 const MAX_AMOUNT_CENTS = 50000; // $500
+// A claim with no payment proof unlocks after about a day so someone else
+// can try (agreed Fix 2). A proof the asker never acts on unlocks after
+// 7 days, so a forgotten proof cannot lock an ask forever.
+const CLAIM_PROOF_WINDOW_MS = 24 * 60 * 60 * 1000;
+const PROOF_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+// Board review token (env BOARD_TOKEN on Render). Without it the review
+// endpoints stay closed — the board cannot vote until it is set.
+const BOARD_TOKEN = process.env.BOARD_TOKEN || "";
+const BOARD_VOTERS = ["darin", "maya", "milo"] as const;
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB
+const UPLOAD_TYPES: Record<string, string> = {
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
 
 export const CATEGORIES = [
   "Utility bill",
@@ -116,6 +133,99 @@ async function authedAccount(req: Request) {
   return account ?? null;
 }
 
+function boardToken(req: Request): string | null {
+  const h = req.headers.get("x-board-token");
+  return h && h.trim() ? h.trim() : null;
+}
+
+function requireBoard(req: Request): Response | null {
+  if (!BOARD_TOKEN) {
+    return err("Board review is not set up yet.", 503);
+  }
+  if (boardToken(req) !== BOARD_TOKEN) {
+    return err("Board token required.", 401);
+  }
+  return null;
+}
+
+// Lazy maintenance, run on reads so no background job is needed:
+// - a locked ask with no payment proof unlocks after about a day;
+// - a proof the asker never acts on unlocks after 7 days;
+// - an open ask older than 30 days expires off the board.
+async function releaseStaleClaims(): Promise<void> {
+  const t = now();
+  await db
+    .update(asks)
+    .set({
+      claimedAt: null,
+      claimedByDevice: null,
+      proofConfirmation: null,
+      proofReceiptPath: null,
+      proofSubmittedAt: null,
+      status: "open",
+    })
+    .where(
+      and(
+        eq(asks.status, "locked"),
+        sql`${asks.proofSubmittedAt} IS NULL`,
+        sql`${asks.claimedAt} < ${t - CLAIM_PROOF_WINDOW_MS}`,
+      ),
+    );
+  await db
+    .update(asks)
+    .set({
+      claimedAt: null,
+      claimedByDevice: null,
+      proofConfirmation: null,
+      proofReceiptPath: null,
+      proofSubmittedAt: null,
+      status: "open",
+    })
+    .where(
+      and(
+        eq(asks.status, "locked"),
+        sql`${asks.proofSubmittedAt} IS NOT NULL`,
+        sql`${asks.proofSubmittedAt} < ${t - PROOF_STALE_MS}`,
+      ),
+    );
+}
+
+async function expireOldAsks(): Promise<void> {
+  await db
+    .update(asks)
+    .set({ status: "expired" })
+    .where(
+      and(
+        eq(asks.status, "open"),
+        sql`${asks.createdAt} < ${now() - THIRTY_DAYS_MS}`,
+      ),
+    );
+}
+
+// Store an uploaded image under the uploads dir. Returns the stored
+// relative filename, or null when there is no file. Throws on bad type
+// or oversize.
+async function saveUpload(file: unknown): Promise<string | null> {
+  if (!file || typeof file !== "object") return null;
+  const f = file as File;
+  if (typeof f.arrayBuffer !== "function" || !f.name) return null;
+  const ext = extname(f.name).toLowerCase();
+  if (!UPLOAD_TYPES[ext]) {
+    throw new Error("Only image files (JPG, PNG, WebP, GIF) can be uploaded.");
+  }
+  if (f.size > MAX_UPLOAD_BYTES) {
+    throw new Error("That image is too big — 5 MB max.");
+  }
+  const name = `${crypto.randomUUID()}${ext}`;
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  writeFileSync(join(UPLOAD_DIR, name), bytes);
+  return name;
+}
+
+function uploadContentType(name: string): string {
+  return UPLOAD_TYPES[extname(name).toLowerCase()] || "application/octet-stream";
+}
+
 // How many times this bill account number has had an ask met (all time).
 async function helpedCount(accountNumber: string): Promise<number> {
   const rows = await db
@@ -167,6 +277,7 @@ async function publicAsk(row: typeof asks.$inferSelect) {
     helpedCount: count,
     helpedLabel: helpedLabel(count),
     id: row.id,
+    needVerified: row.needVerified === 1,
     payee: row.payee,
     state: row.state,
   };
@@ -180,9 +291,14 @@ function ownAsk(row: typeof asks.$inferSelect) {
     createdAt: row.createdAt,
     cutoffDate: row.cutoffDate,
     dueDate: row.dueDate,
+    hasReceipt: !!row.proofReceiptPath,
     id: row.id,
     metAt: row.metAt,
+    needProofStatus: row.needProofStatus,
+    needVerified: row.needVerified === 1,
     payee: row.payee,
+    proofConfirmation: row.proofConfirmation,
+    proofSubmittedAt: row.proofSubmittedAt,
     state: row.state,
     status: row.status,
   };
@@ -242,6 +358,8 @@ async function handle(req: Request): Promise<Response> {
 
   // -- Public board ---------------------------------------------------------
   if (method === "GET" && path === "/api/board") {
+    await releaseStaleClaims();
+    await expireOldAsks();
     const rows = await db
       .select()
       .from(asks)
@@ -382,7 +500,26 @@ async function handle(req: Request): Promise<Response> {
   if (method === "POST" && path === "/api/asks") {
     const account = await authedAccount(req);
     if (!account) return err("Sign in first.", 401);
-    const body = await parseBody(req);
+    await releaseStaleClaims();
+    await expireOldAsks();
+    // Accepts JSON, or multipart when the asker attaches a bill photo
+    // (optional, board-only) as the `needProof` file field.
+    let body: Record<string, unknown> = {};
+    let needProofPath: string | null = null;
+    const contentType = req.headers.get("content-type") || "";
+    if (contentType.includes("multipart/form-data")) {
+      try {
+        const form = await req.formData();
+        for (const [k, v] of form.entries()) {
+          if (typeof v === "string") body[k] = v;
+        }
+        needProofPath = await saveUpload(form.get("needProof"));
+      } catch (e: any) {
+        return err(e?.message || "Could not read the ask.", 400);
+      }
+    } else {
+      body = await parseBody(req);
+    }
     const payee = typeof body.payee === "string" ? body.payee.trim() : "";
     const category =
       typeof body.category === "string" ? body.category : "";
@@ -501,6 +638,8 @@ async function handle(req: Request): Promise<Response> {
           createdAt: now(),
           cutoffDate,
           dueDate,
+          needProofPath,
+          needProofStatus: needProofPath ? "pending" : "none",
           payee,
           state,
           status: "open",
@@ -526,7 +665,7 @@ async function handle(req: Request): Promise<Response> {
     return json({ asks: rows.map(ownAsk) });
   }
 
-  const askIdMatch = path.match(/^\/api\/asks\/(\d+)\/(withdraw|claim|confirm-paid|release)$/);
+  const askIdMatch = path.match(/^\/api\/asks\/(\d+)\/(withdraw|claim|submit-proof|confirm-paid|reject-proof|release)$/);
   if (askIdMatch) {
     const askId = Number(askIdMatch[1]);
     const action = askIdMatch[2];
@@ -562,6 +701,12 @@ async function handle(req: Request): Promise<Response> {
     if (method === "POST" && action === "claim") {
       const device = deviceToken(req);
       if (!device) return err("This device could not be identified.", 400);
+      await releaseStaleClaims();
+      await expireOldAsks();
+      // No self-claims (agreed Fix 3): the system quietly knows who owns
+      // an ask. A signed-in asker claiming their own ask just hears the
+      // ask isn't available — no names, no explanation.
+      const account = await authedAccount(req);
       const claimed = await db.transaction(async (tx) => {
         const [row] = await tx
           .select()
@@ -569,6 +714,9 @@ async function handle(req: Request): Promise<Response> {
           .where(eq(asks.id, askId))
           .limit(1);
         if (!row) return { error: "Ask not found.", status: 404 };
+        if (account && row.accountId === account.id) {
+          return { error: "This ask isn't available.", status: 403 };
+        }
         if (row.status !== "open") {
           return {
             error: "This ask is no longer open — someone else may have claimed it.",
@@ -605,9 +753,15 @@ async function handle(req: Request): Promise<Response> {
       });
     }
 
-    if (method === "POST" && action === "confirm-paid") {
+    // Proof of payment (agreed Fix 2): the giver submits the payment's
+    // confirmation number and, optionally, a receipt image. No more
+    // one-click "I paid it" — a claim without proof unlocks after about
+    // a day, and only the asker can mark the ask met, after checking the
+    // confirmation number with the payee.
+    if (method === "POST" && action === "submit-proof") {
       const device = deviceToken(req);
       if (!device) return err("This device could not be identified.", 400);
+      await releaseStaleClaims();
       const [row] = await db
         .select()
         .from(asks)
@@ -617,9 +771,100 @@ async function handle(req: Request): Promise<Response> {
       if (row.status !== "locked" || row.claimedByDevice !== device) {
         return err("This ask is not claimed by this device.", 403);
       }
+      if (row.proofConfirmation) {
+        return err("Payment proof is already submitted for this ask.", 409);
+      }
+      let confirmation = "";
+      let receiptPath: string | null = null;
+      const contentType = req.headers.get("content-type") || "";
+      try {
+        if (contentType.includes("multipart/form-data")) {
+          const form = await req.formData();
+          const c = form.get("confirmation");
+          confirmation = typeof c === "string" ? c.trim() : "";
+          receiptPath = await saveUpload(form.get("receipt"));
+        } else {
+          const body = await parseBody(req);
+          confirmation =
+            typeof body.confirmation === "string"
+              ? body.confirmation.trim()
+              : "";
+        }
+      } catch (e: any) {
+        return err(e?.message || "Could not read the proof.", 400);
+      }
+      if (!confirmation || confirmation.length < 3 || confirmation.length > 64) {
+        return err(
+          "Add the payment confirmation number from the payee — the asker checks it with them.",
+          400,
+        );
+      }
+      await db
+        .update(asks)
+        .set({
+          proofConfirmation: confirmation,
+          proofReceiptPath: receiptPath,
+          proofSubmittedAt: now(),
+        })
+        .where(eq(asks.id, askId));
+      return json({ ok: true });
+    }
+
+    // The ASKER confirms the payment cleared, after checking the
+    // confirmation number with the payee. This is the only way an ask
+    // becomes met now.
+    if (method === "POST" && action === "confirm-paid") {
+      const account = await authedAccount(req);
+      if (!account) return err("Sign in first.", 401);
+      const [row] = await db
+        .select()
+        .from(asks)
+        .where(eq(asks.id, askId))
+        .limit(1);
+      if (!row) return err("Ask not found.", 404);
+      if (row.accountId !== account.id) {
+        return err("That is not your ask.", 403);
+      }
+      if (row.status !== "locked" || !row.proofConfirmation) {
+        return err(
+          "There is no payment proof to confirm yet — the giver sends the confirmation number first.",
+          409,
+        );
+      }
       await db
         .update(asks)
         .set({ metAt: now(), status: "met" })
+        .where(eq(asks.id, askId));
+      return json({ ok: true });
+    }
+
+    // The asker says the proof did not clear with the payee: the ask
+    // goes back on the board for someone else, and the proof is cleared.
+    if (method === "POST" && action === "reject-proof") {
+      const account = await authedAccount(req);
+      if (!account) return err("Sign in first.", 401);
+      const [row] = await db
+        .select()
+        .from(asks)
+        .where(eq(asks.id, askId))
+        .limit(1);
+      if (!row) return err("Ask not found.", 404);
+      if (row.accountId !== account.id) {
+        return err("That is not your ask.", 403);
+      }
+      if (row.status !== "locked" || !row.proofConfirmation) {
+        return err("There is no payment proof to reject.", 409);
+      }
+      await db
+        .update(asks)
+        .set({
+          claimedAt: null,
+          claimedByDevice: null,
+          proofConfirmation: null,
+          proofReceiptPath: null,
+          proofSubmittedAt: null,
+          status: "open",
+        })
         .where(eq(asks.id, askId));
       return json({ ok: true });
     }
@@ -646,6 +891,8 @@ async function handle(req: Request): Promise<Response> {
 
   // -- Yours: asks this device claimed + the signed-in asker's own asks -----
   if (method === "GET" && path === "/api/yours") {
+    await releaseStaleClaims();
+    await expireOldAsks();
     const device = deviceToken(req);
     let claimed: unknown[] = [];
     if (device) {
@@ -667,9 +914,12 @@ async function handle(req: Request): Promise<Response> {
         category: row.category,
         cutoffDate: row.cutoffDate,
         dueDate: row.dueDate,
+        hasReceipt: !!row.proofReceiptPath,
         id: row.id,
         metAt: row.metAt,
         payee: row.payee,
+        proofConfirmation: row.proofConfirmation,
+        proofSubmittedAt: row.proofSubmittedAt,
         state: row.state,
         status: row.status,
       }));
@@ -685,6 +935,145 @@ async function handle(req: Request): Promise<Response> {
       mine = rows.map(ownAsk);
     }
     return json({ claimed, mine });
+  }
+
+  // -- Proof images: served only to someone entitled to see them --------
+  const receiptMatch = path.match(/^\/api\/asks\/(\d+)\/receipt$/);
+  if (method === "GET" && receiptMatch) {
+    const askId = Number(receiptMatch[1]);
+    const [row] = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.id, askId))
+      .limit(1);
+    if (!row || !row.proofReceiptPath) return err("Not found.", 404);
+    const account = await authedAccount(req);
+    const device = deviceToken(req);
+    const isAsker = account && account.id === row.accountId;
+    const isGiver = device && row.claimedByDevice === device;
+    const isBoard = BOARD_TOKEN && boardToken(req) === BOARD_TOKEN;
+    if (!isAsker && !isGiver && !isBoard) {
+      return err("Not found.", 404);
+    }
+    const filePath = join(UPLOAD_DIR, row.proofReceiptPath);
+    if (!existsSync(filePath)) return err("Not found.", 404);
+    return new Response(readFileSync(filePath), {
+      headers: { "Content-Type": uploadContentType(row.proofReceiptPath) },
+    });
+  }
+
+  const needProofMatch = path.match(/^\/api\/asks\/(\d+)\/need-proof$/);
+  if (method === "GET" && needProofMatch) {
+    const askId = Number(needProofMatch[1]);
+    const [row] = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.id, askId))
+      .limit(1);
+    if (!row || !row.needProofPath) return err("Not found.", 404);
+    const account = await authedAccount(req);
+    const isAsker = account && account.id === row.accountId;
+    const isBoard = BOARD_TOKEN && boardToken(req) === BOARD_TOKEN;
+    if (!isAsker && !isBoard) {
+      return err("Not found.", 404);
+    }
+    const filePath = join(UPLOAD_DIR, row.needProofPath);
+    if (!existsSync(filePath)) return err("Not found.", 404);
+    return new Response(readFileSync(filePath), {
+      headers: { "Content-Type": uploadContentType(row.needProofPath) },
+    });
+  }
+
+  // -- Board review: verified need (agreed Fix 1) --------------------------
+  // The board is Darin + Maya + Milo. All three vote on each attached bill
+  // proof: amount matches, no personal info visible, allowed bill type.
+  // All three approvals set the verified-need flag; any rejection rejects.
+  if (method === "GET" && path === "/api/board/review") {
+    const denied = requireBoard(req);
+    if (denied) return denied;
+    const rows = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.needProofStatus, "pending"))
+      .orderBy(desc(asks.createdAt));
+    const out = [];
+    for (const row of rows) {
+      const votes = await db
+        .select()
+        .from(needVotes)
+        .where(eq(needVotes.askId, row.id));
+      out.push({
+        amount: dollars(row.amountCents),
+        category: row.category,
+        createdAt: row.createdAt,
+        id: row.id,
+        needProofStatus: row.needProofStatus,
+        needVerified: row.needVerified === 1,
+        payee: row.payee,
+        state: row.state,
+        votes: votes.map((v) => ({ vote: v.vote, voter: v.voter })),
+      });
+    }
+    return json({ asks: out });
+  }
+
+  const voteMatch = path.match(/^\/api\/board\/review\/(\d+)\/vote$/);
+  if (method === "POST" && voteMatch) {
+    const denied = requireBoard(req);
+    if (denied) return denied;
+    const askId = Number(voteMatch[1]);
+    const body = await parseBody(req);
+    const voter = typeof body.voter === "string" ? body.voter : "";
+    const vote = typeof body.vote === "string" ? body.vote : "";
+    if (!(BOARD_VOTERS as readonly string[]).includes(voter)) {
+      return err("Voter must be darin, maya, or milo.", 400);
+    }
+    if (vote !== "approve" && vote !== "reject") {
+      return err("Vote must be approve or reject.", 400);
+    }
+    const [row] = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.id, askId))
+      .limit(1);
+    if (!row) return err("Ask not found.", 404);
+    if (row.needProofStatus !== "pending") {
+      return err("This proof is no longer awaiting review.", 409);
+    }
+    await db
+      .insert(needVotes)
+      .values({ askId, createdAt: now(), vote, voter })
+      .onConflictDoUpdate({
+        set: { createdAt: now(), vote },
+        target: [needVotes.askId, needVotes.voter],
+      });
+    const votes = await db
+      .select()
+      .from(needVotes)
+      .where(eq(needVotes.askId, askId));
+    const approvals = votes.filter((v) => v.vote === "approve").length;
+    const rejections = votes.filter((v) => v.vote === "reject").length;
+    if (rejections > 0) {
+      await db
+        .update(asks)
+        .set({ needProofStatus: "rejected" })
+        .where(eq(asks.id, askId));
+    } else if (approvals >= BOARD_VOTERS.length) {
+      await db
+        .update(asks)
+        .set({ needProofStatus: "verified", needVerified: 1 })
+        .where(eq(asks.id, askId));
+    }
+    const [updated] = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.id, askId))
+      .limit(1);
+    return json({
+      needProofStatus: updated.needProofStatus,
+      needVerified: updated.needVerified === 1,
+      votes: votes.map((v) => ({ vote: v.vote, voter: v.voter })),
+    });
   }
 
   return err("Not found.", 404);
