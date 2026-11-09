@@ -856,6 +856,10 @@ function App() {
         <div className="wrap">
           <h1>A Hand Up</h1>
           <p>Small bills. Paid directly. No cash ever touches the asker.</p>
+          <p className="welcome">
+            Welcome in — pull up a chair. Somebody here needs a hand, and
+            somebody else can give it.
+          </p>
         </div>
       </header>
       <nav>
