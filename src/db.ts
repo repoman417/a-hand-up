@@ -45,6 +45,7 @@ function openDb(path: string): BunSQLiteDatabase<typeof schema> {
       proof_confirmation TEXT,
       proof_submitted_at INTEGER,
       proof_receipt_path TEXT,
+      gift_card_code TEXT,
       need_proof_path TEXT,
       need_proof_status TEXT NOT NULL DEFAULT 'none',
       need_verified INTEGER NOT NULL DEFAULT 0
@@ -78,6 +79,7 @@ function openDb(path: string): BunSQLiteDatabase<typeof schema> {
   addColumn("proof_confirmation", "proof_confirmation TEXT");
   addColumn("proof_submitted_at", "proof_submitted_at INTEGER");
   addColumn("proof_receipt_path", "proof_receipt_path TEXT");
+  addColumn("gift_card_code", "gift_card_code TEXT");
   addColumn("need_proof_path", "need_proof_path TEXT");
   addColumn("need_proof_status", "need_proof_status TEXT NOT NULL DEFAULT 'none'");
   addColumn("need_verified", "need_verified INTEGER NOT NULL DEFAULT 0");

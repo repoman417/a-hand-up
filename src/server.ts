@@ -291,6 +291,7 @@ function ownAsk(row: typeof asks.$inferSelect) {
     createdAt: row.createdAt,
     cutoffDate: row.cutoffDate,
     dueDate: row.dueDate,
+    giftCardCode: row.giftCardCode,
     hasReceipt: !!row.proofReceiptPath,
     id: row.id,
     metAt: row.metAt,
@@ -775,6 +776,7 @@ async function handle(req: Request): Promise<Response> {
         return err("Payment proof is already submitted for this ask.", 409);
       }
       let confirmation = "";
+      let giftCard = "";
       let receiptPath: string | null = null;
       const contentType = req.headers.get("content-type") || "";
       try {
@@ -782,6 +784,8 @@ async function handle(req: Request): Promise<Response> {
           const form = await req.formData();
           const c = form.get("confirmation");
           confirmation = typeof c === "string" ? c.trim() : "";
+          const g = form.get("giftCard");
+          giftCard = typeof g === "string" ? g.trim() : "";
           receiptPath = await saveUpload(form.get("receipt"));
         } else {
           const body = await parseBody(req);
@@ -789,6 +793,8 @@ async function handle(req: Request): Promise<Response> {
             typeof body.confirmation === "string"
               ? body.confirmation.trim()
               : "";
+          giftCard =
+            typeof body.giftCard === "string" ? body.giftCard.trim() : "";
         }
       } catch (e: any) {
         return err(e?.message || "Could not read the proof.", 400);
@@ -799,9 +805,13 @@ async function handle(req: Request): Promise<Response> {
           400,
         );
       }
+      if (giftCard && giftCard.length > 64) {
+        return err("The gift card code must be 64 characters or fewer.", 400);
+      }
       await db
         .update(asks)
         .set({
+          giftCardCode: giftCard || null,
           proofConfirmation: confirmation,
           proofReceiptPath: receiptPath,
           proofSubmittedAt: now(),
@@ -860,6 +870,7 @@ async function handle(req: Request): Promise<Response> {
         .set({
           claimedAt: null,
           claimedByDevice: null,
+          giftCardCode: null,
           proofConfirmation: null,
           proofReceiptPath: null,
           proofSubmittedAt: null,

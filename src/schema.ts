@@ -22,6 +22,10 @@ export const accounts = sqliteTable("accounts", {
 // Verified need (Fix 1): the asker may attach a bill photo (needProofPath)
 // visible only to the board. needProofStatus: none | pending | verified |
 // rejected. needVerified is set when all three board members approve.
+// Gift cards (Nov 10, 2026): for Groceries asks the giver buys a gift
+// card instead of paying a bill account. giftCardCode holds the card
+// number + PIN the giver sends with the proof, shown readable to the
+// asker only (ownAsk) — never in a public payload.
 export const asks = sqliteTable("asks", {
   accountId: integer("account_id").notNull(),
   accountNumber: text("account_number").notNull(),
@@ -32,6 +36,7 @@ export const asks = sqliteTable("asks", {
   createdAt: integer("created_at").notNull(),
   cutoffDate: text("cutoff_date"),
   dueDate: text("due_date"),
+  giftCardCode: text("gift_card_code"),
   id: integer("id").primaryKey({ autoIncrement: true }),
   metAt: integer("met_at"),
   needProofPath: text("need_proof_path"),

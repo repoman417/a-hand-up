@@ -188,6 +188,7 @@ type OwnAsk = {
   needProofStatus: string;
   proofConfirmation: string | null;
   proofSubmittedAt: number | null;
+  giftCardCode: string | null;
   hasReceipt: boolean;
 };
 
@@ -229,12 +230,14 @@ function LoadError({ message, onRetry }: { message: string; onRetry: () => void 
 // Payment proof form (giver side) — shared by the board and Yours views
 // ---------------------------------------------------------------------------
 
-function ProofForm({ askId, onSubmitted, onError }: {
+function ProofForm({ askId, category, onSubmitted, onError }: {
   askId: number;
+  category: string;
   onSubmitted: () => void;
   onError: (msg: string) => void;
 }) {
   const [confirmation, setConfirmation] = useState("");
+  const [giftCard, setGiftCard] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -244,6 +247,7 @@ function ProofForm({ askId, onSubmitted, onError }: {
     try {
       const form = new FormData();
       form.append("confirmation", confirmation);
+      if (giftCard.trim()) form.append("giftCard", giftCard.trim());
       if (file) form.append("receipt", file);
       await fetchForm(`/api/asks/${askId}/submit-proof`, form);
       onSubmitted();
@@ -265,6 +269,20 @@ function ProofForm({ askId, onSubmitted, onError }: {
           autoComplete="off"
         />
       </label>
+      {category === "Groceries" && (
+        <label>
+          Gift card number + PIN
+          <span className="hint">
+            {" "}(for grocery asks — the asker sees this and uses it to spend the card)
+          </span>
+          <input
+            value={giftCard}
+            onChange={(e) => setGiftCard(e.target.value)}
+            placeholder="The gift card number and PIN"
+            autoComplete="off"
+          />
+        </label>
+      )}
       <label>
         Receipt photo <span className="hint">(optional — helps the asker check it)</span>
         <input
@@ -342,6 +360,7 @@ function GiverClaimCard({ ask, onReleased, onProofSubmitted, onError }: {
           ) : (
             <ProofForm
               askId={ask.id}
+              category={ask.category}
               onSubmitted={onProofSubmitted}
               onError={onError}
             />
@@ -945,6 +964,12 @@ function YoursView({ me }: { me: MeData | null }) {
                   Payment proof sent — confirmation number:{" "}
                   <code>{ask.proofConfirmation}</code>
                 </p>
+                {ask.giftCardCode && (
+                  <p style={{ marginTop: 0 }}>
+                    Gift card code: <code>{ask.giftCardCode}</code>
+                    {" "}— spend this at the store; it is shown to you only.
+                  </p>
+                )}
                 <p>
                   Check that number with the payee. If it cleared, confirm
                   it below and the ask comes off the board for good.

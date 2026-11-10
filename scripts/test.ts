@@ -14,6 +14,7 @@ const BOARD_TOKEN = process.env.BOARD_TOKEN || "";
 const D1 = "device-giver-one";
 const D2 = "device-giver-two";
 const D3 = "device-giver-three";
+const D4 = "device-giver-four";
 
 let passed = 0;
 let failed = 0;
@@ -554,6 +555,91 @@ if (!BOARD_TOKEN) {
     JSON.stringify(r.data),
   );
 }
+
+// 23 — gift-card code: a grocery giver sends the card number + PIN
+// with the proof; only the asker sees it; rejecting clears it.
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-GROC-001",
+    amount: 25,
+    category: "Groceries",
+    payee: "Test Grocery Store",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token3,
+});
+check("post grocery ask ($25) succeeds", r.status === 201, JSON.stringify(r.data));
+const askG = r.data.ask?.id as number;
+r = await req(`/api/asks/${askG}/claim`, { device: D4, method: "POST" });
+check("claim grocery ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askG}/submit-proof`, {
+  body: { confirmation: "CONF-GC-001", giftCard: "GC-TEST-1234-5678" },
+  device: D4,
+  method: "POST",
+});
+check("submit proof with gift card (JSON) succeeds", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/asks/mine", { token: token3 });
+const mineG = (r.data.asks || []).find((a: any) => a.id === askG);
+check(
+  "asker sees gift card code on their own ask",
+  mineG?.giftCardCode === "GC-TEST-1234-5678" &&
+    mineG?.proofConfirmation === "CONF-GC-001",
+  JSON.stringify(mineG),
+);
+r = await req("/api/board");
+check(
+  "public board payload never includes the gift card code",
+  !JSON.stringify(r.data).includes("GC-TEST-1234-5678"),
+);
+r = await req(`/api/asks/${askG}/reject-proof`, { method: "POST", token: token3 });
+check("asker rejects gift-card proof", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/asks/mine", { token: token3 });
+const mineG2 = (r.data.asks || []).find((a: any) => a.id === askG);
+check(
+  "reject-proof clears gift card code and confirmation",
+  mineG2?.giftCardCode == null && mineG2?.proofConfirmation == null,
+  JSON.stringify(mineG2),
+);
+r = await req("/api/board");
+check(
+  "rejected gift-card ask is back on the board",
+  (r.data.asks || []).some((a: any) => a.id === askG),
+);
+r = await req(`/api/asks/${askG}/claim`, { device: D4, method: "POST" });
+check("re-claim grocery ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askG}/submit-proof`, {
+  body: { confirmation: "CONF-GC-002", giftCard: "x".repeat(65) },
+  device: D4,
+  method: "POST",
+});
+check(
+  "gift card code over 64 chars is rejected",
+  r.status === 400,
+  `status=${r.status}`,
+);
+const formG = new FormData();
+formG.append("confirmation", "CONF-GC-003");
+formG.append("giftCard", "GC-TEST-9999-0000");
+const upResG = await fetch(`${BASE}/api/asks/${askG}/submit-proof`, {
+  body: formG,
+  headers: { "X-Device-Token": D4 },
+  method: "POST",
+});
+check(
+  "submit proof with gift card (multipart) succeeds",
+  upResG.status === 200,
+  `status=${upResG.status}`,
+);
+r = await req("/api/asks/mine", { token: token3 });
+const mineG3 = (r.data.asks || []).find((a: any) => a.id === askG);
+check(
+  "multipart gift card code stored for asker",
+  mineG3?.giftCardCode === "GC-TEST-9999-0000",
+  JSON.stringify(mineG3),
+);
+r = await req(`/api/asks/${askG}/confirm-paid`, { method: "POST", token: token3 });
+check("asker confirms gift-card ask met", r.status === 200, `status=${r.status}`);
 
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
