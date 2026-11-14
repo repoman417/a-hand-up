@@ -190,6 +190,8 @@ type OwnAsk = {
   proofSubmittedAt: number | null;
   giftCardCode: string | null;
   hasReceipt: boolean;
+  removedAt: number | null;
+  removedReason: string | null;
 };
 
 type MeData = {
@@ -210,6 +212,7 @@ function statusLabel(status: string): string {
   if (status === "met") return "Met — thank you";
   if (status === "withdrawn") return "Withdrawn";
   if (status === "expired") return "Expired — off the board after 30 days";
+  if (status === "removed") return "Removed by the board";
   return status;
 }
 
@@ -958,6 +961,19 @@ function YoursView({ me }: { me: MeData | null }) {
             {ask.needVerified && (
               <p><span className="badge verified">Verified need</span></p>
             )}
+            {ask.status === "removed" && ask.removedReason && (
+              <div className="pay-box">
+                <p style={{ marginTop: 0 }}>
+                  The board removed this ask. Their reason:
+                </p>
+                <p style={{ marginTop: 0 }}><strong>{ask.removedReason}</strong></p>
+                <p>
+                  If this was a genuine need, you can post a new ask any
+                  time — see &ldquo;How it works&rdquo; for how to ask for
+                  gas, food, and other needs.
+                </p>
+              </div>
+            )}
             {ask.status === "locked" && ask.proofConfirmation && (
               <div className="pay-box">
                 <p style={{ marginTop: 0 }}>
@@ -1027,6 +1043,8 @@ function ReviewView() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [voter, setVoter] = useState("darin");
+  const [removeId, setRemoveId] = useState("");
+  const [removeReason, setRemoveReason] = useState("");
 
   async function boardFetch(path: string, opts: RequestInit = {}): Promise<any> {
     const headers: Record<string, string> = {
@@ -1078,6 +1096,35 @@ function ReviewView() {
   function saveToken() {
     setBoardToken(token || null);
     load();
+  }
+
+  // Board removal (Nov 13, 2026): only after all three board members
+  // agree in conversation. The reason is shown to the asker on their own
+  // page next time they log in, with how to ask correctly.
+  async function removeAsk() {
+    setError(null);
+    setNotice(null);
+    const id = Number(removeId);
+    if (!Number.isInteger(id) || id <= 0) {
+      setError("Enter the ask number to remove.");
+      return;
+    }
+    if (!removeReason.trim()) {
+      setError("A reason is required — the asker sees it.");
+      return;
+    }
+    try {
+      await boardFetch(`/api/board/remove/${id}`, {
+        body: JSON.stringify({ reason: removeReason.trim() }),
+        method: "POST",
+      });
+      setNotice(`Ask ${id} removed. The asker will see the reason on their page.`);
+      setRemoveId("");
+      setRemoveReason("");
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not remove the ask.");
+    }
   }
 
   return (
@@ -1145,6 +1192,38 @@ function ReviewView() {
           </div>
         </div>
       ))}
+      <div className="card">
+        <h2>Remove an ask</h2>
+        <p>
+          Only after all three board members agree in conversation. The
+          reason is shown to the asker on their own page next time they log
+          in, with how to ask correctly — so a genuine asker learns instead
+          of wondering where their ask went.
+        </p>
+        <label>
+          Ask number
+          <input
+            value={removeId}
+            onChange={(e) => setRemoveId(e.target.value)}
+            placeholder="e.g. 11"
+            autoComplete="off"
+          />
+        </label>
+        <label>
+          Reason — the asker sees this
+          <textarea
+            value={removeReason}
+            onChange={(e) => setRemoveReason(e.target.value)}
+            placeholder="Why this ask came down, and how to ask it correctly."
+            rows={3}
+          />
+        </label>
+        <div className="btn-row">
+          <button className="btn danger" onClick={removeAsk}>
+            Remove this ask
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

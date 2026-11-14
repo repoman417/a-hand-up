@@ -48,7 +48,9 @@ function openDb(path: string): BunSQLiteDatabase<typeof schema> {
       gift_card_code TEXT,
       need_proof_path TEXT,
       need_proof_status TEXT NOT NULL DEFAULT 'none',
-      need_verified INTEGER NOT NULL DEFAULT 0
+      need_verified INTEGER NOT NULL DEFAULT 0,
+      removed_at INTEGER,
+      removed_reason TEXT
     );
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
@@ -83,6 +85,8 @@ function openDb(path: string): BunSQLiteDatabase<typeof schema> {
   addColumn("need_proof_path", "need_proof_path TEXT");
   addColumn("need_proof_status", "need_proof_status TEXT NOT NULL DEFAULT 'none'");
   addColumn("need_verified", "need_verified INTEGER NOT NULL DEFAULT 0");
+  addColumn("removed_at", "removed_at INTEGER");
+  addColumn("removed_reason", "removed_reason TEXT");
   return drizzle(sqlite, { schema });
 }
 

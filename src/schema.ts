@@ -11,7 +11,7 @@ export const accounts = sqliteTable("accounts", {
   passwordHash: text("password_hash").notNull(),
 });
 
-// Asks. status: open | locked | met | withdrawn | expired.
+// Asks. status: open | locked | met | withdrawn | expired | removed.
 // The bill account number is stored here and is NEVER included in a public
 // payload — it is shown only to the asker (their own ask) and to the giver
 // who claimed the ask.
@@ -26,6 +26,11 @@ export const accounts = sqliteTable("accounts", {
 // card instead of paying a bill account. giftCardCode holds the card
 // number + PIN the giver sends with the proof, shown readable to the
 // asker only (ownAsk) — never in a public payload.
+// Board removal (Nov 13, 2026): when all three board members agree an ask
+// should come down, the board removes it with a reason. removedReason is
+// shown to the asker on their own page next time they log in, with how to
+// ask correctly — so a genuine asker learns instead of wondering where
+// their ask went.
 export const asks = sqliteTable("asks", {
   accountId: integer("account_id").notNull(),
   accountNumber: text("account_number").notNull(),
@@ -46,6 +51,8 @@ export const asks = sqliteTable("asks", {
   proofConfirmation: text("proof_confirmation"),
   proofReceiptPath: text("proof_receipt_path"),
   proofSubmittedAt: integer("proof_submitted_at"),
+  removedAt: integer("removed_at"),
+  removedReason: text("removed_reason"),
   state: text("state").notNull(),
   status: text("status").notNull().default("open"),
 });

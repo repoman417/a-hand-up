@@ -686,6 +686,83 @@ check(
   `status=${r.status} ${JSON.stringify(r.data)}`,
 );
 
+// 25 — board removal (Nov 13, 2026): the board can remove an open ask
+// with a reason; the asker sees the reason on their own page next login.
+r = await req("/api/accounts", {
+  body: { handle: "testasker5", password: "testpass123" },
+  method: "POST",
+});
+check("create fifth test account", r.status === 201, JSON.stringify(r.data));
+const token5 = r.data.token as string;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-REM-001",
+    amount: 50,
+    category: "Utility bill",
+    payee: "Test Remove Power",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token5,
+});
+check("post ask to remove succeeds", r.status === 201, JSON.stringify(r.data));
+const askR = r.data.ask?.id as number;
+r = await req(`/api/board/remove/${askR}`, {
+  body: { reason: "Test removal reason." },
+  method: "POST",
+});
+check("remove without board token is denied", r.status === 401, `status=${r.status}`);
+r = await req(`/api/board/remove/${askR}`, {
+  board: BOARD_TOKEN,
+  body: {},
+  method: "POST",
+});
+check("remove without a reason is rejected", r.status === 400, `status=${r.status}`);
+r = await req(`/api/board/remove/${askR}`, {
+  board: BOARD_TOKEN,
+  body: {
+    reason:
+      "The account number was not a real one — for gas, pick Other, name the station, and the giver sends a gift card.",
+  },
+  method: "POST",
+});
+check(
+  "board removes the ask with a reason",
+  r.status === 200 && r.data.ask?.status === "removed",
+  JSON.stringify(r.data),
+);
+r = await req("/api/board");
+check(
+  "removed ask is off the public board",
+  !(r.data.asks || []).some((a: any) => a.id === askR),
+);
+r = await req("/api/asks/mine", { token: token5 });
+const mineR = (r.data.asks || []).find((a: any) => a.id === askR);
+check(
+  "asker sees the removal reason on their own ask",
+  mineR?.status === "removed" && (mineR?.removedReason || "").includes("gift card"),
+  JSON.stringify(mineR),
+);
+r = await req(`/api/board/remove/${askR}`, {
+  board: BOARD_TOKEN,
+  body: { reason: "Again." },
+  method: "POST",
+});
+check("removing twice is rejected", r.status === 409, `status=${r.status}`);
+// askC1 is still locked from test 24; askB was confirmed met earlier.
+r = await req(`/api/board/remove/${askC1}`, {
+  board: BOARD_TOKEN,
+  body: { reason: "Locked test." },
+  method: "POST",
+});
+check("removing a locked ask is rejected", r.status === 409, `status=${r.status}`);
+r = await req(`/api/board/remove/${askB}`, {
+  board: BOARD_TOKEN,
+  body: { reason: "Met test." },
+  method: "POST",
+});
+check("removing a met ask is rejected", r.status === 409, `status=${r.status}`);
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   console.log("Failures:", failures.join("; "));

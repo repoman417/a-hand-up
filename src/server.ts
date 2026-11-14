@@ -300,6 +300,8 @@ function ownAsk(row: typeof asks.$inferSelect) {
     payee: row.payee,
     proofConfirmation: row.proofConfirmation,
     proofSubmittedAt: row.proofSubmittedAt,
+    removedAt: row.removedAt,
+    removedReason: row.removedReason,
     state: row.state,
     status: row.status,
   };
@@ -1111,6 +1113,57 @@ async function handle(req: Request): Promise<Response> {
       needProofStatus: updated.needProofStatus,
       needVerified: updated.needVerified === 1,
       votes: votes.map((v) => ({ vote: v.vote, voter: v.voter })),
+    });
+  }
+
+  // Board removal (Nov 13, 2026): when all three board members agree an
+  // ask should come down, the board removes it with a reason. The reason
+  // is stored on the ask and shown to the asker on their own page next
+  // time they log in, with how to ask correctly — so a genuine asker
+  // learns instead of wondering where their ask went. Only open asks can
+  // be removed: a locked ask has a giver who may be paying right now, and
+  // a met ask is already paid.
+  const removeMatch = path.match(/^\/api\/board\/remove\/(\d+)$/);
+  if (method === "POST" && removeMatch) {
+    const denied = requireBoard(req);
+    if (denied) return denied;
+    const askId = Number(removeMatch[1]);
+    const body = await parseBody(req);
+    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    if (!reason) {
+      return err("A reason is required — the asker sees it.", 400);
+    }
+    if (reason.length > 500) {
+      return err("Reason must be 500 characters or fewer.", 400);
+    }
+    const [row] = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.id, askId))
+      .limit(1);
+    if (!row) return err("Ask not found.", 404);
+    if (row.status === "removed") {
+      return err("This ask is already removed.", 409);
+    }
+    if (row.status === "met") {
+      return err("This ask is already met and cannot be removed.", 409);
+    }
+    if (row.status === "locked") {
+      return err(
+        "This ask is claimed right now — a giver may be paying it. Remove it once it is back on the board.",
+        409,
+      );
+    }
+    if (row.status !== "open") {
+      return err("This ask can no longer be removed.", 409);
+    }
+    const removedAt = now();
+    await db
+      .update(asks)
+      .set({ removedAt, removedReason: reason, status: "removed" })
+      .where(eq(asks.id, askId));
+    return json({
+      ask: ownAsk({ ...row, removedAt, removedReason: reason, status: "removed" }),
     });
   }
 
