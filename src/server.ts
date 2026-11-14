@@ -724,6 +724,33 @@ async function handle(req: Request): Promise<Response> {
             status: 409,
           };
         }
+        // $500 rolling cap, checked at claim time too (board ruling Nov 13,
+        // 2026): the cap was only enforced at creation, so two open asks
+        // from one account could both be claimed and met for over $500.
+        // A claim that would push the asker over the cap is blocked.
+        const cutoff = now() - THIRTY_DAYS_MS;
+        const usedRows = await tx
+          .select({
+            total: sql<number>`coalesce(sum(${asks.amountCents}), 0)`,
+          })
+          .from(asks)
+          .where(
+            and(
+              eq(asks.accountId, row.accountId),
+              sql`(
+                (${asks.status} = 'met' AND ${asks.metAt} >= ${cutoff})
+                OR (${asks.status} = 'locked' AND ${asks.claimedAt} >= ${cutoff})
+              )`,
+            ),
+          );
+        const used = usedRows[0]?.total ?? 0;
+        if (used + row.amountCents > CAP_CENTS) {
+          return {
+            error:
+              "This ask can't be claimed right now — it would put the asker over the $500 limit for the last 30 days.",
+            status: 409,
+          };
+        }
         await tx
           .update(asks)
           .set({

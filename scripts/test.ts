@@ -641,6 +641,51 @@ check(
 r = await req(`/api/asks/${askG}/confirm-paid`, { method: "POST", token: token3 });
 check("asker confirms gift-card ask met", r.status === 200, `status=${r.status}`);
 
+// 24 — $500 cap enforced at claim time too (board ruling Nov 13, 2026):
+// two open $300 asks from one account can both be created (nothing met
+// or locked yet), but the second claim must fail — claiming both would
+// put the asker at $600, over the cap.
+r = await req("/api/accounts", {
+  body: { handle: "testasker4", password: "testpass123" },
+  method: "POST",
+});
+check("create fourth test account", r.status === 201, JSON.stringify(r.data));
+const token4 = r.data.token as string;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-CAP-001",
+    amount: 300,
+    category: "Utility bill",
+    payee: "Test Cap Power One",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token4,
+});
+check("post first $300 cap ask succeeds", r.status === 201, JSON.stringify(r.data));
+const askC1 = r.data.ask?.id as number;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-CAP-002",
+    amount: 300,
+    category: "Utility bill",
+    payee: "Test Cap Power Two",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token4,
+});
+check("post second $300 cap ask succeeds", r.status === 201, JSON.stringify(r.data));
+const askC2 = r.data.ask?.id as number;
+r = await req(`/api/asks/${askC1}/claim`, { device: D1, method: "POST" });
+check("claim first cap ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askC2}/claim`, { device: D2, method: "POST" });
+check(
+  "second claim blocked — would put asker over the $500 cap",
+  r.status === 409,
+  `status=${r.status} ${JSON.stringify(r.data)}`,
+);
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   console.log("Failures:", failures.join("; "));
