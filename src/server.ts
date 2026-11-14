@@ -228,6 +228,8 @@ function uploadContentType(name: string): string {
 
 // How many times this bill account number has had an ask met (all time).
 async function helpedCount(accountNumber: string): Promise<number> {
+  // No account number (Other gift-card asks) — nothing to count against.
+  if (!accountNumber) return 0;
   const rows = await db
     .select({ n: sql<number>`count(*)` })
     .from(asks)
@@ -549,7 +551,7 @@ async function handle(req: Request): Promise<Response> {
     if (!Number.isFinite(amount) || amount < 5 || amount > 500) {
       return err("Amount must be between $5 and $500.");
     }
-    if (!accountNumber || accountNumber.length > 64) {
+    if ((!accountNumber && category !== "Other") || accountNumber.length > 64) {
       return err("The bill account number is required.");
     }
     if (!US_STATES.includes(state)) {
@@ -567,44 +569,51 @@ async function handle(req: Request): Promise<Response> {
     const result = await db.transaction(async (tx) => {
       const cutoff = now() - THIRTY_DAYS_MS;
 
-      // One met ask per bill account number per 30 days.
-      const metRows = await tx
-        .select()
-        .from(asks)
-        .where(
-          and(
-            eq(asks.accountNumber, accountNumber),
-            eq(asks.status, "met"),
-          ),
-        )
-        .orderBy(desc(asks.metAt))
-        .limit(1);
-      const lastMet = metRows[0];
-      if (lastMet?.metAt && lastMet.metAt >= cutoff) {
-        const again = new Date(lastMet.metAt + THIRTY_DAYS_MS);
-        return {
-          error: `This bill already had an ask met in the last 30 days. One met ask per bill account number per 30 days — you can post it again after ${again.toLocaleDateString("en-US")}.`,
-          status: 409,
-        };
+      // One met ask per bill account number per 30 days. Skipped when
+      // there is no account number (Other gift-card asks have none) —
+      // otherwise two gift-card asks would collide on the empty number.
+      if (accountNumber) {
+        const metRows = await tx
+          .select()
+          .from(asks)
+          .where(
+            and(
+              eq(asks.accountNumber, accountNumber),
+              eq(asks.status, "met"),
+            ),
+          )
+          .orderBy(desc(asks.metAt))
+          .limit(1);
+        const lastMet = metRows[0];
+        if (lastMet?.metAt && lastMet.metAt >= cutoff) {
+          const again = new Date(lastMet.metAt + THIRTY_DAYS_MS);
+          return {
+            error: `This bill already had an ask met in the last 30 days. One met ask per bill account number per 30 days — you can post it again after ${again.toLocaleDateString("en-US")}.`,
+            status: 409,
+          };
+        }
       }
 
-      // One open ask per bill at a time.
-      const openRows = await tx
-        .select({ id: asks.id })
-        .from(asks)
-        .where(
-          and(
-            eq(asks.accountNumber, accountNumber),
-            sql`${asks.status} IN ('open', 'locked')`,
-          ),
-        )
-        .limit(1);
-      if (openRows.length > 0) {
-        return {
-          error:
-            "There is already an open ask for this bill account number. One ask per bill at a time.",
-          status: 409,
-        };
+      // One open ask per bill at a time. Skipped with no account number,
+      // for the same reason as the met check above.
+      if (accountNumber) {
+        const openRows = await tx
+          .select({ id: asks.id })
+          .from(asks)
+          .where(
+            and(
+              eq(asks.accountNumber, accountNumber),
+              sql`${asks.status} IN ('open', 'locked')`,
+            ),
+          )
+          .limit(1);
+        if (openRows.length > 0) {
+          return {
+            error:
+              "There is already an open ask for this bill account number. One ask per bill at a time.",
+            status: 409,
+          };
+        }
       }
 
       // $500 rolling total per asker per 30 days (met + locked).

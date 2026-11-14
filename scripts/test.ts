@@ -763,6 +763,87 @@ r = await req(`/api/board/remove/${askB}`, {
 });
 check("removing a met ask is rejected", r.status === 409, `status=${r.status}`);
 
+// 26 — Other guidance (majority vote Nov 13, 2026): an Other ask needs
+// no bill account number; the gift-card proof works for Other; a bill
+// ask still requires one.
+r = await req("/api/accounts", {
+  body: { handle: "testasker6", password: "testpass123" },
+  method: "POST",
+});
+check("create sixth test account", r.status === 201, JSON.stringify(r.data));
+const token6 = r.data.token as string;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "",
+    amount: 40,
+    category: "Other",
+    payee: "Test Gas Station",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token6,
+});
+check(
+  "post Other gas ask with no account number succeeds",
+  r.status === 201,
+  JSON.stringify(r.data),
+);
+const askO1 = r.data.ask?.id as number;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "",
+    amount: 25,
+    category: "Other",
+    payee: "Test Grocery Store",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token6,
+});
+check(
+  "second Other ask with no account number succeeds (no false dedup)",
+  r.status === 201,
+  JSON.stringify(r.data),
+);
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "",
+    amount: 50,
+    category: "Utility bill",
+    payee: "Test Utility",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: token6,
+});
+check(
+  "bill ask with no account number is still rejected",
+  r.status === 400,
+  `status=${r.status} ${JSON.stringify(r.data)}`,
+);
+r = await req("/api/board");
+const boardO1 = (r.data.asks || []).find((a: any) => a.id === askO1);
+check(
+  "Other ask shows on the board as first time asking",
+  boardO1?.helpedLabel === "First time asking",
+  JSON.stringify(boardO1),
+);
+r = await req(`/api/asks/${askO1}/claim`, { device: D3, method: "POST" });
+check("claim Other ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askO1}/submit-proof`, {
+  body: { confirmation: "CONF-OTHER-001", giftCard: "GC-OTHER-1234" },
+  device: D3,
+  method: "POST",
+});
+check("submit gift-card proof for Other succeeds", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/asks/mine", { token: token6 });
+const mineO1 = (r.data.asks || []).find((a: any) => a.id === askO1);
+check(
+  "asker sees the Other gift card code on their own ask",
+  mineO1?.giftCardCode === "GC-OTHER-1234",
+  JSON.stringify(mineO1),
+);
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   console.log("Failures:", failures.join("; "));

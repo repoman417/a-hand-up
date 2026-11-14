@@ -272,11 +272,11 @@ function ProofForm({ askId, category, onSubmitted, onError }: {
           autoComplete="off"
         />
       </label>
-      {category === "Groceries" && (
+      {(category === "Groceries" || category === "Other") && (
         <label>
           Gift card number + PIN
           <span className="hint">
-            {" "}(for grocery asks — the asker sees this and uses it to spend the card)
+            {" "}(for grocery and Other asks — the asker sees this and uses it to spend the card)
           </span>
           <input
             value={giftCard}
@@ -350,6 +350,18 @@ function GiverClaimCard({ ask, onReleased, onProofSubmitted, onError }: {
             No cash goes to the asker, ever. Once you&rsquo;ve paid, send the
             confirmation number below so the asker can check it with the
             payee — that&rsquo;s what takes the ask off the board.
+          </p>
+        </div>
+      )}
+      {ask.status === "locked" && !ask.accountNumber && (
+        <div className="pay-box">
+          <p style={{ marginTop: 0 }}>
+            No bill account for this one — buy a gift card from the payee
+            named above and send the card number + PIN below as your proof.
+          </p>
+          <p>
+            No cash goes to the asker, ever. The card number goes to the
+            asker only, so they can spend it.
           </p>
         </div>
       )}
@@ -721,6 +733,16 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
               ))}
             </select>
           </label>
+          {category === "Other" && (
+            <p className="hint">
+              Other covers anything — here&rsquo;s how to ask for it. Gas:
+              name the gas station, and the giver sends a gift card. Food:
+              name the store, same thing. A hotel stay: name the hotel. An
+              Amazon list: name the item, and the giver orders it and has
+              it shipped. No bill account number is needed for these —
+              leave that box blank.
+            </p>
+          )}
           <label>
             Amount (dollars)
             <input
@@ -734,7 +756,7 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
             />
           </label>
           <label>
-            Bill account number <span className="hint">(required — only the claiming giver sees it)</span>
+            Bill account number <span className="hint">({category === "Other" ? "optional for Other — leave blank if there is no bill" : "required — only the claiming giver sees it"})</span>
             <input
               value={accountNumber}
               onChange={(e) => setAccountNumber(e.target.value)}
@@ -956,7 +978,9 @@ function YoursView({ me }: { me: MeData | null }) {
             </p>
             <p>
               Status: <span className={`status ${ask.status}`}>{statusLabel(ask.status)}</span>
-              {" — "}account number: <code>{ask.accountNumber}</code>
+              {ask.accountNumber ? (
+                <>{" — "}account number: <code>{ask.accountNumber}</code></>
+              ) : null}
             </p>
             {ask.needVerified && (
               <p><span className="badge verified">Verified need</span></p>
