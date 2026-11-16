@@ -230,6 +230,87 @@ function LoadError({ message, onRetry }: { message: string; onRetry: () => void 
 }
 
 // ---------------------------------------------------------------------------
+// Share A Hand Up (board vote, unanimous Nov 16, 2026)
+// ---------------------------------------------------------------------------
+// Shares ONLY the site homepage — never any individual ask, account
+// number, or ask detail. Anonymity is the site's core promise.
+const SHARE_TITLE = "A Hand Up";
+const SHARE_TEXT =
+  "A Hand Up lets an anonymous neighbor pay a stranger's bill directly to the company — no cash, no middleman.";
+const SHARE_URL = "https://a-hand-up.onrender.com";
+
+async function copyShareLink(): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(SHARE_URL);
+    return true;
+  } catch {
+    // Fallback for browsers without the async clipboard API.
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = SHARE_URL;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function ShareButton({ light }: { light?: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  async function share() {
+    setFailed(false);
+    if (typeof navigator !== "undefined" && "share" in navigator) {
+      try {
+        await navigator.share({
+          text: SHARE_TEXT,
+          title: SHARE_TITLE,
+          url: SHARE_URL,
+        });
+        return;
+      } catch (e: any) {
+        // The visitor dismissed the share sheet — not an error.
+        if (e && e.name === "AbortError") return;
+        // Anything else falls through to the copy-link fallback.
+      }
+    }
+    const ok = await copyShareLink();
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2500);
+    } else {
+      setFailed(true);
+    }
+  }
+
+  return (
+    <span className="share-wrap">
+      <button
+        type="button"
+        className={light ? "btn share-light" : "btn secondary"}
+        onClick={share}
+        aria-label="Share A Hand Up"
+      >
+        {copied ? "Link copied ✓" : "Share A Hand Up"}
+      </button>
+      {failed && (
+        <span style={{ fontSize: ".88rem" }}>
+          {" "}Couldn&rsquo;t copy the link — the address is
+          a-hand-up.onrender.com.
+        </span>
+      )}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Payment proof form (giver side) — shared by the board and Yours views
 // ---------------------------------------------------------------------------
 
@@ -1411,6 +1492,9 @@ function App() {
             Welcome in — pull up a chair. Somebody here needs a hand, and
             somebody else can give it.
           </p>
+          <div className="share-row">
+            <ShareButton light />
+          </div>
         </div>
       </header>
       <nav>
@@ -1465,8 +1549,13 @@ function App() {
         {view === "review" && <ReviewView />}
       </main>
       <footer>
-        Free for the asker, always. It might help you get a need met, it
-        might not — but it is totally free to try.
+        <div className="share-row">
+          <ShareButton />
+        </div>
+        <p>
+          Free for the asker, always. It might help you get a need met, it
+          might not — but it is totally free to try.
+        </p>
       </footer>
     </div>
   );
