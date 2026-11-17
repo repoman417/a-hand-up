@@ -844,6 +844,651 @@ check(
   JSON.stringify(mineO1),
 );
 
+// 27 — board password reset (unanimous Nov 17, 2026): the board issues
+// a one-time temp password; it expires after first login or 24 hours,
+// and the asker must change it before doing anything else.
+r = await req("/api/accounts", {
+  body: { handle: "testreset", password: "oldpass123" },
+  method: "POST",
+});
+check("create reset-test account", r.status === 201 && !!r.data.token, JSON.stringify(r.data));
+const resetToken0 = r.data.token as string;
+r = await req("/api/board/reset-password", {
+  body: { handle: "testreset" },
+  method: "POST",
+});
+check("board reset without token is denied", r.status === 401, `status=${r.status}`);
+r = await req("/api/board/reset-password", {
+  board: BOARD_TOKEN,
+  body: { handle: "nosuchhandle" },
+  method: "POST",
+});
+check("board reset for unknown handle is 404", r.status === 404, `status=${r.status}`);
+r = await req("/api/board/reset-password", {
+  board: BOARD_TOKEN,
+  body: { handle: "testreset" },
+  method: "POST",
+});
+check(
+  "board reset returns a temp password expiring in ~24h",
+  r.status === 200 &&
+    typeof r.data.tempPassword === "string" &&
+    r.data.tempPassword.length === 12 &&
+    r.data.expiresAt > Date.now() &&
+    r.data.expiresAt <= Date.now() + 24 * 60 * 60 * 1000 + 60000,
+  JSON.stringify(r.data),
+);
+const tempPw = r.data.tempPassword as string;
+r = await req("/api/accounts/login", {
+  body: { handle: "testreset", password: "oldpass123" },
+  method: "POST",
+});
+check("old password stops working after a board reset", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/me", { token: resetToken0 });
+check("old session dies on a board reset", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/login", {
+  body: { handle: "testreset", password: tempPw },
+  method: "POST",
+});
+check(
+  "temp password logs in and forces a change",
+  r.status === 200 && r.data.mustChangePassword === true && !!r.data.token,
+  JSON.stringify(r.data),
+);
+const resetToken1 = r.data.token as string;
+r = await req("/api/accounts/login", {
+  body: { handle: "testreset", password: tempPw },
+  method: "POST",
+});
+check("temp password cannot log in twice", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/me", { token: resetToken1 });
+check("forced-change account cannot use other endpoints", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/password-status", { token: resetToken1 });
+check(
+  "password-status reports must-change",
+  r.status === 200 && r.data.mustChangePassword === true,
+  JSON.stringify(r.data),
+);
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-RESET-001",
+    amount: 10,
+    category: "Utility bill",
+    payee: "Test Reset Power",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: resetToken1,
+});
+check("forced-change account cannot post an ask", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/change-password", {
+  body: { newPassword: "newpass123" },
+  method: "POST",
+  token: resetToken1,
+});
+check("change password with the temp session succeeds", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/accounts/password-status", { token: resetToken1 });
+check(
+  "password-status clears after the change",
+  r.status === 200 && r.data.mustChangePassword === false,
+  JSON.stringify(r.data),
+);
+r = await req("/api/accounts/login", {
+  body: { handle: "testreset", password: tempPw },
+  method: "POST",
+});
+check("temp password stops working after the change", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/login", {
+  body: { handle: "testreset", password: "newpass123" },
+  method: "POST",
+});
+check(
+  "new password logs in normally",
+  r.status === 200 && r.data.mustChangePassword === false,
+  JSON.stringify(r.data),
+);
+const resetToken2 = r.data.token as string;
+r = await req("/api/board/reset-password", {
+  board: BOARD_TOKEN,
+  body: { handle: "testreset" },
+  method: "POST",
+});
+check("second board reset succeeds", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/accounts/password-status", { token: resetToken2 });
+check("second reset kills the previous session", r.status === 401, `status=${r.status}`);
+
+// Temp password expiry (24h): seed an already-expired temp password.
+if (!TEST_DB) {
+  console.log("SKIP  temp-password expiry check (TEST_DB not set)");
+} else {
+  r = await req("/api/accounts", {
+    body: { handle: "testreset2", password: "oldpass123" },
+    method: "POST",
+  });
+  check("create second reset-test account", r.status === 201, JSON.stringify(r.data));
+  r = await req("/api/board/reset-password", {
+    board: BOARD_TOKEN,
+    body: { handle: "testreset2" },
+    method: "POST",
+  });
+  const tempPw2 = r.data.tempPassword as string;
+  check("board reset for second account succeeds", r.status === 200, JSON.stringify(r.data));
+  const sqlite = new Database(TEST_DB);
+  sqlite
+    .query(`UPDATE accounts SET temp_password_expires_at = ? WHERE handle = 'testreset2'`)
+    .run(Date.now() - 1000);
+  r = await req("/api/accounts/login", {
+    body: { handle: "testreset2", password: tempPw2 },
+    method: "POST",
+  });
+  check(
+    "expired temp password is refused",
+    r.status === 401 && /expired/.test(r.data.error || ""),
+    JSON.stringify(r.data),
+  );
+}
+
+// 28 — tally gap fix (Nov 17, 2026): a claimed ask shows "Claimed —
+// waiting for proof" with the 24h countdown, and if the giver pays but
+// never uploads proof, the asker confirms with their own bill's
+// confirmation number; the board verifies before the tally moves.
+r = await req("/api/accounts", {
+  body: { handle: "testtally", password: "testpass123" },
+  method: "POST",
+});
+check("create tally-test account", r.status === 201 && !!r.data.token, JSON.stringify(r.data));
+const tokenT = r.data.token as string;
+r = await req("/api/proof");
+const metBefore = r.data.metCount as number;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-TALLY-001",
+    amount: 60,
+    category: "Utility bill",
+    payee: "Test Tally Power",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: tokenT,
+});
+check("post tally ask ($60) succeeds", r.status === 201, JSON.stringify(r.data));
+const askT = r.data.ask?.id as number;
+r = await req(`/api/asks/${askT}/claim`, { device: "device-tally-1", method: "POST" });
+check("claim tally ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req("/api/yours", { token: tokenT });
+const mineT = (r.data.mine || []).find((a: any) => a.id === askT);
+check(
+  "yours shows the claimed ask with a 24h countdown",
+  mineT?.status === "locked" &&
+    typeof mineT?.claimExpiresAt === "number" &&
+    mineT.claimExpiresAt > Date.now() &&
+    mineT.claimExpiresAt <= Date.now() + 24 * 60 * 60 * 1000 + 60000,
+  JSON.stringify(mineT),
+);
+r = await req(`/api/asks/${askT}/asker-confirm`, {
+  body: { confirmation: "ab" },
+  method: "POST",
+  token: tokenT,
+});
+check("asker-confirm with too-short number is rejected", r.status === 400, `status=${r.status}`);
+r = await req(`/api/asks/${askT}/asker-confirm`, {
+  body: { confirmation: "CONF-ASKER-001" },
+  method: "POST",
+  token: tokenT,
+});
+check("asker confirms with their own bill's number", r.status === 200, JSON.stringify(r.data));
+r = await req(`/api/asks/${askT}/asker-confirm`, {
+  body: { confirmation: "CONF-ASKER-002" },
+  method: "POST",
+  token: tokenT,
+});
+check("asker-confirm while one is pending is rejected", r.status === 409, `status=${r.status}`);
+r = await req("/api/board/review", { board: BOARD_TOKEN });
+const acItem = (r.data.askerConfirms || []).find((a: any) => a.id === askT);
+check(
+  "review queue surfaces the asker-confirm",
+  !!acItem && acItem.askerConfirmation === "CONF-ASKER-001",
+  JSON.stringify(r.data.askerConfirms),
+);
+r = await req(`/api/board/review/${askT}/asker-confirm-vote`, {
+  body: { vote: "approve", voter: "darin" },
+  method: "POST",
+});
+check("asker-confirm vote without board token is denied", r.status === 401, `status=${r.status}`);
+r = await req(`/api/board/review/${askT}/asker-confirm-vote`, {
+  board: BOARD_TOKEN,
+  body: { vote: "approve", voter: "bob" },
+  method: "POST",
+});
+check("asker-confirm vote with a bad voter is rejected", r.status === 400, `status=${r.status}`);
+r = await req(`/api/board/review/${askT}/asker-confirm-vote`, {
+  board: BOARD_TOKEN,
+  body: { vote: "approve", voter: "darin" },
+  method: "POST",
+});
+check(
+  "first approval leaves the confirm pending",
+  r.status === 200 && r.data.askerConfirmStatus === "pending",
+  JSON.stringify(r.data),
+);
+r = await req(`/api/board/review/${askT}/asker-confirm-vote`, {
+  board: BOARD_TOKEN,
+  body: { vote: "approve", voter: "maya" },
+  method: "POST",
+});
+check(
+  "second approval leaves the confirm pending",
+  r.status === 200 && r.data.askerConfirmStatus === "pending",
+  JSON.stringify(r.data),
+);
+r = await req(`/api/board/review/${askT}/asker-confirm-vote`, {
+  board: BOARD_TOKEN,
+  body: { vote: "approve", voter: "jason" },
+  method: "POST",
+});
+check(
+  "third approval verifies — ask met",
+  r.status === 200 && r.data.askerConfirmStatus === "verified",
+  JSON.stringify(r.data),
+);
+r = await req("/api/proof");
+check(
+  "tally moves by 1 after board verification",
+  r.data.metCount === metBefore + 1,
+  JSON.stringify(r.data),
+);
+r = await req("/api/asks/mine", { token: tokenT });
+const mineT2 = (r.data.asks || []).find((a: any) => a.id === askT);
+check(
+  "verified asker-confirm shows the ask as met",
+  mineT2?.status === "met",
+  JSON.stringify(mineT2),
+);
+
+// Rejection path: a bad number is rejected, the asker re-submits.
+r = await req("/api/accounts", {
+  body: { handle: "testtally2", password: "testpass123" },
+  method: "POST",
+});
+check("create second tally-test account", r.status === 201 && !!r.data.token, JSON.stringify(r.data));
+const tokenT2 = r.data.token as string;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-TALLY-002",
+    amount: 40,
+    category: "Utility bill",
+    payee: "Test Tally Gas",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: tokenT2,
+});
+check("post second tally ask ($40) succeeds", r.status === 201, JSON.stringify(r.data));
+const askT2 = r.data.ask?.id as number;
+r = await req(`/api/asks/${askT2}/claim`, { device: "device-tally-2", method: "POST" });
+check("claim second tally ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askT2}/asker-confirm`, {
+  body: { confirmation: "CONF-BAD-001" },
+  method: "POST",
+  token: tokenT2,
+});
+check("asker confirms with a bad number", r.status === 200, JSON.stringify(r.data));
+r = await req(`/api/board/review/${askT2}/asker-confirm-vote`, {
+  board: BOARD_TOKEN,
+  body: { vote: "reject", voter: "maya" },
+  method: "POST",
+});
+check(
+  "one rejection rejects the confirm",
+  r.status === 200 && r.data.askerConfirmStatus === "rejected",
+  JSON.stringify(r.data),
+);
+r = await req("/api/asks/mine", { token: tokenT2 });
+const mineT2b = (r.data.asks || []).find((a: any) => a.id === askT2);
+check(
+  "rejected confirm shows as rejected on the asker's page",
+  mineT2b?.askerConfirmStatus === "rejected",
+  JSON.stringify(mineT2b),
+);
+r = await req(`/api/asks/${askT2}/asker-confirm`, {
+  body: { confirmation: "CONF-GOOD-001" },
+  method: "POST",
+  token: tokenT2,
+});
+check("asker re-submits a corrected number", r.status === 200, JSON.stringify(r.data));
+for (const voter of ["darin", "maya", "milo"]) {
+  r = await req(`/api/board/review/${askT2}/asker-confirm-vote`, {
+    board: BOARD_TOKEN,
+    body: { vote: "approve", voter },
+    method: "POST",
+  });
+}
+check(
+  "corrected number verifies with three approvals",
+  r.status === 200 && r.data.askerConfirmStatus === "verified",
+  JSON.stringify(r.data),
+);
+r = await req("/api/proof");
+check(
+  "tally moves again after the corrected confirm",
+  r.data.metCount === metBefore + 2,
+  JSON.stringify(r.data),
+);
+
+// Asker-confirm is blocked once the giver's proof is already in, on an
+// open ask, and for someone else's ask.
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-TALLY-003",
+    amount: 30,
+    category: "Utility bill",
+    payee: "Test Tally Water",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: tokenT2,
+});
+check("post third tally ask ($30) succeeds", r.status === 201, JSON.stringify(r.data));
+const askT3 = r.data.ask?.id as number;
+r = await req(`/api/asks/${askT3}/claim`, { device: "device-tally-3", method: "POST" });
+check("claim third tally ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req(`/api/asks/${askT3}/submit-proof`, {
+  body: { confirmation: "CONF-G-001" },
+  device: "device-tally-3",
+  method: "POST",
+});
+check("giver submits proof for third tally ask", r.status === 200, JSON.stringify(r.data));
+r = await req(`/api/asks/${askT3}/asker-confirm`, {
+  body: { confirmation: "CONF-ASKER-003" },
+  method: "POST",
+  token: tokenT2,
+});
+check(
+  "asker-confirm blocked when the giver's proof is already in",
+  r.status === 409,
+  `status=${r.status}`,
+);
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-TALLY-004",
+    amount: 30,
+    category: "Utility bill",
+    payee: "Test Tally Sewer",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: tokenT2,
+});
+check("post fourth tally ask ($30) succeeds", r.status === 201, JSON.stringify(r.data));
+const askT4 = r.data.ask?.id as number;
+r = await req(`/api/asks/${askT4}/asker-confirm`, {
+  body: { confirmation: "CONF-ASKER-004" },
+  method: "POST",
+  token: tokenT2,
+});
+check("asker-confirm blocked on an open ask", r.status === 409, `status=${r.status}`);
+r = await req(`/api/asks/${askT3}/asker-confirm`, {
+  body: { confirmation: "CONF-ASKER-003" },
+  method: "POST",
+  token: tokenT,
+});
+check(
+  "asker-confirm blocked for someone else's ask",
+  r.status === 403,
+  `status=${r.status}`,
+);
+
+// 29 — forgot password (Nov 17, 2026): no email; the request is tied to
+// the device that made it, the board approves, then that same device
+// sets a new password.
+r = await req("/api/accounts", {
+  body: { handle: "testforgot", password: "forgotpass1" },
+  method: "POST",
+});
+check("create forgot-test account", r.status === 201 && !!r.data.token, JSON.stringify(r.data));
+r = await req("/api/accounts/forgot-password", {
+  body: { handle: "testforgot" },
+  method: "POST",
+});
+check("forgot-password without a device is rejected", r.status === 400, `status=${r.status}`);
+r = await req("/api/accounts/forgot-password", {
+  body: { handle: "testforgot" },
+  device: "device-forgot-1",
+  method: "POST",
+});
+check("forgot-password request succeeds", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/accounts/forgot-password", {
+  body: { handle: "testforgot" },
+  device: "device-forgot-1",
+  method: "POST",
+});
+check("a second pending request is rejected", r.status === 409, `status=${r.status}`);
+r = await req("/api/accounts/forgot-password", {
+  body: { handle: "nosuchhandle" },
+  device: "device-forgot-1",
+  method: "POST",
+});
+check(
+  "forgot-password for an unknown handle answers generically",
+  r.status === 200,
+  `status=${r.status}`,
+);
+r = await req("/api/board/review", { board: BOARD_TOKEN });
+const prItem = (r.data.passwordResets || []).find((x: any) => x.handle === "testforgot");
+check(
+  "review queue surfaces the reset request",
+  !!prItem,
+  JSON.stringify(r.data.passwordResets),
+);
+r = await req("/api/accounts/reset-password", {
+  body: { handle: "testforgot", newPassword: "newforgot1" },
+  device: "device-forgot-2",
+  method: "POST",
+});
+check(
+  "reset from a different device is refused",
+  r.status === 403,
+  `status=${r.status}`,
+);
+r = await req(`/api/board/review/password-reset/${prItem?.id}/decision`, {
+  body: { decision: "approve" },
+  method: "POST",
+});
+check("reset decision without board token is denied", r.status === 401, `status=${r.status}`);
+r = await req(`/api/board/review/password-reset/${prItem?.id}/decision`, {
+  board: BOARD_TOKEN,
+  body: { decision: "maybe" },
+  method: "POST",
+});
+check("reset decision with a bad value is rejected", r.status === 400, `status=${r.status}`);
+r = await req(`/api/board/review/password-reset/${prItem?.id}/decision`, {
+  board: BOARD_TOKEN,
+  body: { decision: "approve" },
+  method: "POST",
+});
+check(
+  "board approves the reset request",
+  r.status === 200 && r.data.status === "approved",
+  JSON.stringify(r.data),
+);
+r = await req(`/api/board/review/password-reset/${prItem?.id}/decision`, {
+  board: BOARD_TOKEN,
+  body: { decision: "approve" },
+  method: "POST",
+});
+check("deciding the same request twice is rejected", r.status === 409, `status=${r.status}`);
+r = await req("/api/accounts/reset-password", {
+  body: { handle: "testforgot", newPassword: "newforgot1" },
+  device: "device-forgot-2",
+  method: "POST",
+});
+check(
+  "reset from a different device is still refused after approval",
+  r.status === 403,
+  `status=${r.status}`,
+);
+r = await req("/api/accounts/reset-password", {
+  body: { handle: "testforgot", newPassword: "newforgot1" },
+  device: "device-forgot-1",
+  method: "POST",
+});
+check(
+  "reset from the requesting device succeeds",
+  r.status === 200 && !!r.data.token,
+  JSON.stringify(r.data),
+);
+r = await req("/api/accounts/login", {
+  body: { handle: "testforgot", password: "forgotpass1" },
+  method: "POST",
+});
+check("old password stops working after the reset", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/login", {
+  body: { handle: "testforgot", password: "newforgot1" },
+  method: "POST",
+});
+check("new password logs in after the reset", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/accounts/reset-password", {
+  body: { handle: "testforgot", newPassword: "anotherone1" },
+  device: "device-forgot-1",
+  method: "POST",
+});
+check("an approved reset cannot be used twice", r.status === 403, `status=${r.status}`);
+// Rejection path: a new request, rejected by the board, cannot reset.
+r = await req("/api/accounts/forgot-password", {
+  body: { handle: "testforgot" },
+  device: "device-forgot-1",
+  method: "POST",
+});
+check("a new reset request succeeds after the first is used", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/board/review", { board: BOARD_TOKEN });
+const prItem2 = (r.data.passwordResets || []).find((x: any) => x.handle === "testforgot");
+r = await req(`/api/board/review/password-reset/${prItem2?.id}/decision`, {
+  board: BOARD_TOKEN,
+  body: { decision: "reject" },
+  method: "POST",
+});
+check(
+  "board rejects the second request",
+  r.status === 200 && r.data.status === "rejected",
+  JSON.stringify(r.data),
+);
+r = await req("/api/accounts/reset-password", {
+  body: { handle: "testforgot", newPassword: "anotherone1" },
+  device: "device-forgot-1",
+  method: "POST",
+});
+check("a rejected reset cannot set a password", r.status === 403, `status=${r.status}`);
+
+// 30 — change password while signed in (Nov 17, 2026): no old password
+// needed; the signed-in session is the proof; other sessions die.
+r = await req("/api/accounts", {
+  body: { handle: "testchangepw", password: "changepass1" },
+  method: "POST",
+});
+check("create change-password account", r.status === 201 && !!r.data.token, JSON.stringify(r.data));
+const tokenC1 = r.data.token as string;
+r = await req("/api/accounts/login", {
+  body: { handle: "testchangepw", password: "changepass1" },
+  method: "POST",
+});
+check("second login for change-password test", r.status === 200 && !!r.data.token, JSON.stringify(r.data));
+const tokenC2 = r.data.token as string;
+r = await req("/api/accounts/change-password", {
+  body: { newPassword: "changedpass1" },
+  method: "POST",
+});
+check("change password without a session is denied", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/change-password", {
+  body: { newPassword: "short" },
+  method: "POST",
+  token: tokenC1,
+});
+check("change password rejects a short password", r.status === 400, `status=${r.status}`);
+r = await req("/api/accounts/change-password", {
+  body: { newPassword: "changedpass1" },
+  method: "POST",
+  token: tokenC1,
+});
+check("change password succeeds", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/accounts/me", { token: tokenC2 });
+check("other sessions die on a password change", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/me", { token: tokenC1 });
+check("the session that changed the password stays live", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/accounts/login", {
+  body: { handle: "testchangepw", password: "changepass1" },
+  method: "POST",
+});
+check("old password stops working after the change", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts/login", {
+  body: { handle: "testchangepw", password: "changedpass1" },
+  method: "POST",
+});
+check("new password logs in after the change", r.status === 200, JSON.stringify(r.data));
+
+// 31 — board-only locked-asks view (unanimous Nov 17, 2026): claimed
+// asks with their status and time left, no giver details.
+r = await req("/api/board/locked");
+check("locked view without board token is denied", r.status === 401, `status=${r.status}`);
+r = await req("/api/accounts", {
+  body: { handle: "testlocked", password: "testpass123" },
+  method: "POST",
+});
+check("create locked-view account", r.status === 201 && !!r.data.token, JSON.stringify(r.data));
+const tokenL = r.data.token as string;
+r = await req("/api/asks", {
+  body: {
+    accountNumber: "TEST-LOCKED-001",
+    amount: 45,
+    category: "Utility bill",
+    payee: "Test Locked Power",
+    state: "Missouri",
+  },
+  method: "POST",
+  token: tokenL,
+});
+check("post locked-view ask ($45) succeeds", r.status === 201, JSON.stringify(r.data));
+const askL = r.data.ask?.id as number;
+r = await req(`/api/asks/${askL}/claim`, { device: "device-locked-1", method: "POST" });
+check("claim locked-view ask succeeds", r.status === 200, `status=${r.status}`);
+r = await req("/api/board/locked", { board: BOARD_TOKEN });
+const lockedItem = (r.data.asks || []).find((a: any) => a.id === askL);
+const lockedJson = JSON.stringify(r.data);
+check(
+  "locked view lists the claimed ask with a countdown",
+  !!lockedItem &&
+    lockedItem.hasProof === false &&
+    typeof lockedItem.claimExpiresAt === "number" &&
+    lockedItem.claimExpiresAt > Date.now(),
+  JSON.stringify(lockedItem),
+);
+check(
+  "locked view hides account number, handle, and device",
+  !lockedJson.includes("TEST-LOCKED-001") &&
+    !lockedJson.includes("testlocked") &&
+    !lockedJson.includes("device-locked-1"),
+);
+r = await req(`/api/asks/${askL}/submit-proof`, {
+  body: { confirmation: "CONF-LOCK-001" },
+  device: "device-locked-1",
+  method: "POST",
+});
+check("giver submits proof for locked-view ask", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/board/locked", { board: BOARD_TOKEN });
+const lockedItem2 = (r.data.asks || []).find((a: any) => a.id === askL);
+check(
+  "locked view shows proof sent",
+  !!lockedItem2 && lockedItem2.hasProof === true,
+  JSON.stringify(lockedItem2),
+);
+r = await req(`/api/asks/${askL}/confirm-paid`, { method: "POST", token: tokenL });
+check("asker confirms locked-view ask met", r.status === 200, JSON.stringify(r.data));
+r = await req("/api/board/locked", { board: BOARD_TOKEN });
+check(
+  "met ask leaves the locked view",
+  !(r.data.asks || []).some((a: any) => a.id === askL),
+  JSON.stringify(r.data.asks),
+);
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   console.log("Failures:", failures.join("; "));

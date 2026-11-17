@@ -170,6 +170,8 @@ type ClaimedAsk = {
   proofConfirmation: string | null;
   proofSubmittedAt: number | null;
   hasReceipt: boolean;
+  claimedAt: number | null;
+  claimExpiresAt: number | null;
 };
 
 type OwnAsk = {
@@ -192,6 +194,11 @@ type OwnAsk = {
   hasReceipt: boolean;
   removedAt: number | null;
   removedReason: string | null;
+  claimedAt: number | null;
+  claimExpiresAt: number | null;
+  askerConfirmation: string | null;
+  askerConfirmSubmittedAt: number | null;
+  askerConfirmStatus: string;
 };
 
 type MeData = {
@@ -208,12 +215,24 @@ type View = "board" | "ask" | "yours" | "how" | "review";
 // word "locked".
 function statusLabel(status: string): string {
   if (status === "open") return "Open — on the board";
-  if (status === "locked") return "Claimed — a helper has it right now";
+  if (status === "locked") return "Claimed — waiting for proof";
   if (status === "met") return "Met — thank you";
   if (status === "withdrawn") return "Withdrawn";
   if (status === "expired") return "Expired — off the board after 30 days";
   if (status === "removed") return "Removed by the board";
   return status;
+}
+
+// How long is left on a claim's 24-hour proof window, in plain words.
+function timeLeft(expiresAt: number | null): string {
+  if (!expiresAt) return "";
+  const ms = expiresAt - Date.now();
+  if (ms <= 0) return "the time has run out";
+  const mins = Math.floor(ms / 60000);
+  if (mins < 60) return `about ${mins} minute${mins === 1 ? "" : "s"} left`;
+  const hours = Math.floor(mins / 60);
+  const rest = mins % 60;
+  return `about ${hours}h ${rest}m left`;
 }
 
 // ---------------------------------------------------------------------------
@@ -626,12 +645,21 @@ function BoardView({ onClaimed }: { onClaimed: () => void }) {
 // Auth panel (askers only — givers never need an account)
 // ---------------------------------------------------------------------------
 
-function AuthPanel({ onAuthed }: { onAuthed: (me: MeData) => void }) {
+function AuthPanel({ onAuthed, onMustChange }: {
+  onAuthed: (me: MeData) => void;
+  onMustChange: () => void;
+}) {
   const [mode, setMode] = useState<"login" | "create">("login");
   const [handle, setHandle] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Forgot password (Nov 17, 2026): no email exists, so the board
+  // approves the request and this same device sets the new password.
+  const [forgot, setForgot] = useState<"none" | "request" | "reset">("none");
+  const [forgotHandle, setForgotHandle] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [forgotMsg, setForgotMsg] = useState<string | null>(null);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -645,10 +673,55 @@ function AuthPanel({ onAuthed }: { onAuthed: (me: MeData) => void }) {
         method: "POST",
       });
       setAuthToken(data.token);
+      // A board-issued temp password must be changed before anything
+      // else — the forced-change flow.
+      if (data.mustChangePassword) {
+        onMustChange();
+        return;
+      }
       const me = await fetchJSON("/api/accounts/me");
       onAuthed(me);
     } catch (err: any) {
       setError(err.message || "Something went wrong.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function requestReset(e: React.FormEvent) {
+    e.preventDefault();
+    setForgotMsg(null);
+    setBusy(true);
+    try {
+      await fetchJSON("/api/accounts/forgot-password", {
+        body: JSON.stringify({ handle: forgotHandle }),
+        method: "POST",
+      });
+      setForgotMsg(
+        "Your request is with the board. Once they approve it, come back here on this same device and set a new password below.",
+      );
+      setForgot("reset");
+    } catch (err: any) {
+      setForgotMsg(err.message || "Could not send the request.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function completeReset(e: React.FormEvent) {
+    e.preventDefault();
+    setForgotMsg(null);
+    setBusy(true);
+    try {
+      const data = await fetchJSON("/api/accounts/reset-password", {
+        body: JSON.stringify({ handle: forgotHandle, newPassword }),
+        method: "POST",
+      });
+      setAuthToken(data.token);
+      const me = await fetchJSON("/api/accounts/me");
+      onAuthed(me);
+    } catch (err: any) {
+      setForgotMsg(err.message || "Could not set the new password.");
     } finally {
       setBusy(false);
     }
@@ -703,6 +776,166 @@ function AuthPanel({ onAuthed }: { onAuthed: (me: MeData) => void }) {
           </button>
         </div>
       </form>
+      {mode === "login" && forgot === "none" && (
+        <p>
+          <button
+            type="button"
+            className="btn secondary"
+            onClick={() => setForgot("request")}
+          >
+            I forgot my password
+          </button>
+        </p>
+      )}
+      {forgot === "request" && (
+        <form onSubmit={requestReset}>
+          <p>
+            There&rsquo;s no email on file to send a reset to — instead the
+            board approves your request, and then this same device sets the
+            new password. It has to be this device, on this browser.
+          </p>
+          <label>
+            Your handle
+            <input
+              value={forgotHandle}
+              onChange={(e) => setForgotHandle(e.target.value)}
+              placeholder="Your handle"
+              autoComplete="username"
+            />
+          </label>
+          {forgotMsg && <div className="notice">{forgotMsg}</div>}
+          <div className="btn-row">
+            <button className="btn" type="submit" disabled={busy}>
+              {busy ? "Please wait…" : "Ask the board for a reset"}
+            </button>
+            <button
+              type="button"
+              className="btn secondary"
+              onClick={() => setForgot("none")}
+            >
+              Back to sign in
+            </button>
+          </div>
+        </form>
+      )}
+      {forgot === "reset" && (
+        <form onSubmit={completeReset}>
+          <p>
+            If the board has approved your request, set the new password
+            here — on this same device, with the same handle.
+          </p>
+          <label>
+            Your handle
+            <input
+              value={forgotHandle}
+              onChange={(e) => setForgotHandle(e.target.value)}
+              placeholder="Your handle"
+              autoComplete="username"
+            />
+          </label>
+          <label>
+            New password
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="At least 6 characters"
+              autoComplete="new-password"
+            />
+          </label>
+          {forgotMsg && <div className="notice">{forgotMsg}</div>}
+          <div className="btn-row">
+            <button className="btn" type="submit" disabled={busy}>
+              {busy ? "Please wait…" : "Set the new password"}
+            </button>
+            <button
+              type="button"
+              className="btn secondary"
+              onClick={() => setForgot("request")}
+            >
+              Request a reset instead
+            </button>
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Change password (Nov 17, 2026)
+// ---------------------------------------------------------------------------
+// No old password is needed — the signed-in session is the proof. When
+// forced (a board-issued temp password), the user cannot do anything
+// else until this is done.
+
+function ChangePasswordForm({ forced, onDone }: {
+  forced?: boolean;
+  onDone: () => void;
+}) {
+  const [newPassword, setNewPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (newPassword !== confirm) {
+      setError("The two passwords don't match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await fetchJSON("/api/accounts/change-password", {
+        body: JSON.stringify({ newPassword }),
+        method: "POST",
+      });
+      onDone();
+    } catch (err: any) {
+      setError(err.message || "Could not change the password.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card">
+      <h2>{forced ? "Set a new password" : "Change your password"}</h2>
+      {forced && (
+        <p>
+          You signed in with a temporary password from the board. Pick a
+          new one now — you can&rsquo;t do anything else until you do.
+        </p>
+      )}
+      <form onSubmit={submit}>
+        <label>
+          New password
+          <input
+            type="password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            placeholder="At least 6 characters"
+            autoComplete="new-password"
+          />
+        </label>
+        <label>
+          New password, again
+          <input
+            type="password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            placeholder="Same password again"
+            autoComplete="new-password"
+          />
+        </label>
+        {error && <div className="error">{error}</div>}
+        <div className="btn-row">
+          <button className="btn" type="submit" disabled={busy}>
+            {busy ? "Please wait…" : "Set the new password"}
+          </button>
+        </div>
+      </form>
     </div>
   );
 }
@@ -711,7 +944,11 @@ function AuthPanel({ onAuthed }: { onAuthed: (me: MeData) => void }) {
 // Ask for help
 // ---------------------------------------------------------------------------
 
-function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) => void }) {
+function AskView({ me, onAuthed, onMustChange }: {
+  me: MeData | null;
+  onAuthed: (me: MeData) => void;
+  onMustChange: () => void;
+}) {
   const [payee, setPayee] = useState("");
   const [category, setCategory] = useState(CATEGORIES[0]);
   const [amount, setAmount] = useState("");
@@ -723,8 +960,10 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [showChangePw, setShowChangePw] = useState(false);
+  const [pwNotice, setPwNotice] = useState<string | null>(null);
 
-  if (!me) return <AuthPanel onAuthed={onAuthed} />;
+  if (!me) return <AuthPanel onAuthed={onAuthed} onMustChange={onMustChange} />;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -899,6 +1138,27 @@ function AskView({ me, onAuthed }: { me: MeData | null; onAuthed: (me: MeData) =
           </div>
         </form>
       </div>
+      <div className="card">
+        {pwNotice && <div className="notice">{pwNotice}</div>}
+        {showChangePw ? (
+          <ChangePasswordForm
+            onDone={() => {
+              setShowChangePw(false);
+              setPwNotice("Password changed.");
+            }}
+          />
+        ) : (
+          <div className="btn-row">
+            <button
+              type="button"
+              className="btn secondary"
+              onClick={() => setShowChangePw(true)}
+            >
+              Change my password
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -951,6 +1211,58 @@ function AuthedImage({ src, alt, blurred, extraHeaders }: {
       alt={alt}
       style={blurred ? { filter: "blur(6px)", maxWidth: "100%" } : { maxWidth: "100%" }}
     />
+  );
+}
+
+// Asker-confirm form (Nov 17, 2026): the giver paid but never sent
+// proof, so the asker reports the confirmation number from their own
+// bill. The board checks it before the ask counts as met.
+function AskerConfirmForm({ askId, onSubmitted, onError }: {
+  askId: number;
+  onSubmitted: () => void;
+  onError: (msg: string) => void;
+}) {
+  const [confirmation, setConfirmation] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await fetchJSON(`/api/asks/${askId}/asker-confirm`, {
+        body: JSON.stringify({ confirmation }),
+        method: "POST",
+      });
+      onSubmitted();
+    } catch (err: any) {
+      onError(err.message || "Could not send the confirmation number.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <p style={{ marginTop: 0 }}>
+        The helper paid but didn&rsquo;t send proof? Enter the confirmation
+        number from your bill — the board checks it, and the ask counts as
+        met once three of them agree.
+      </p>
+      <label>
+        Confirmation number from your bill
+        <input
+          value={confirmation}
+          onChange={(e) => setConfirmation(e.target.value)}
+          placeholder="e.g. the number the payee gave you"
+          autoComplete="off"
+        />
+      </label>
+      <div className="btn-row">
+        <button className="btn" type="submit" disabled={busy}>
+          {busy ? "Please wait…" : "Send it to the board"}
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -1079,6 +1391,47 @@ function YoursView({ me }: { me: MeData | null }) {
                 </p>
               </div>
             )}
+            {ask.status === "locked" && !ask.proofConfirmation && (
+              <div className="pay-box">
+                <p style={{ marginTop: 0 }}>
+                  A helper has this ask — they have {timeLeft(ask.claimExpiresAt)}{" "}
+                  to send the payment proof. If that time runs out, the ask
+                  goes back on the board for someone else.
+                </p>
+                {ask.askerConfirmStatus === "pending" ? (
+                  <p style={{ marginTop: 0 }}>
+                    Your confirmation number ({ask.askerConfirmation}) is
+                    with the board — the ask counts as met once three of
+                    them agree the amount matches.
+                  </p>
+                ) : ask.askerConfirmStatus === "rejected" ? (
+                  <>
+                    <p style={{ marginTop: 0 }}>
+                      The board didn&rsquo;t accept that confirmation
+                      number. Check it with the payee and try again with
+                      the right one, or wait for the helper&rsquo;s proof.
+                    </p>
+                    <AskerConfirmForm
+                      askId={ask.id}
+                      onSubmitted={() => {
+                        setNotice("Sent to the board — they'll check it.");
+                        load();
+                      }}
+                      onError={(msg) => setError(msg)}
+                    />
+                  </>
+                ) : (
+                  <AskerConfirmForm
+                    askId={ask.id}
+                    onSubmitted={() => {
+                      setNotice("Sent to the board — they'll check it.");
+                      load();
+                    }}
+                    onError={(msg) => setError(msg)}
+                  />
+                )}
+              </div>
+            )}
             {ask.status === "locked" && ask.proofConfirmation && (
               <div className="pay-box">
                 <p style={{ marginTop: 0 }}>
@@ -1142,12 +1495,47 @@ type ReviewAsk = {
   votes: { voter: string; vote: string }[];
 };
 
+type AskerConfirmItem = {
+  id: number;
+  payee: string;
+  category: string;
+  amount: number;
+  state: string;
+  createdAt: number;
+  askerConfirmation: string | null;
+  askerConfirmSubmittedAt: number | null;
+  votes: { voter: string; vote: string }[];
+};
+
+type PasswordResetItem = {
+  id: number;
+  handle: string;
+  createdAt: number;
+};
+
+type LockedAskItem = {
+  id: number;
+  payee: string;
+  category: string;
+  amount: number;
+  state: string;
+  claimedAt: number | null;
+  claimExpiresAt: number | null;
+  hasProof: boolean;
+  proofSubmittedAt: number | null;
+  askerConfirmStatus: string;
+};
+
 function ReviewView() {
   const [token, setToken] = useState(getBoardToken() || "");
   const [asks, setAsks] = useState<ReviewAsk[] | null>(null);
+  const [askerConfirms, setAskerConfirms] = useState<AskerConfirmItem[] | null>(null);
+  const [passwordResets, setPasswordResets] = useState<PasswordResetItem[] | null>(null);
+  const [lockedAsks, setLockedAsks] = useState<LockedAskItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [voter, setVoter] = useState("darin");
+  const [acVoter, setAcVoter] = useState("darin");
   const [removeId, setRemoveId] = useState("");
   const [removeReason, setRemoveReason] = useState("");
 
@@ -1172,9 +1560,19 @@ function ReviewView() {
     try {
       const data = await boardFetch("/api/board/review");
       setAsks(data.asks);
+      setAskerConfirms(data.askerConfirms || []);
+      setPasswordResets(data.passwordResets || []);
     } catch (e: any) {
       setError(e.message || "Could not load the review queue.");
       setAsks(null);
+      setAskerConfirms(null);
+      setPasswordResets(null);
+    }
+    try {
+      const locked = await boardFetch("/api/board/locked");
+      setLockedAsks(locked.asks);
+    } catch {
+      setLockedAsks(null);
     }
   }
 
@@ -1195,6 +1593,49 @@ function ReviewView() {
       await load();
     } catch (e: any) {
       setError(e.message || "Could not record the vote.");
+    }
+  }
+
+  // Asker-confirm votes (Nov 17, 2026): three of four board members
+  // verifying the amount matches makes the ask met; any rejection
+  // rejects it.
+  async function acVote(askId: number, vote: "approve" | "reject") {
+    setError(null);
+    try {
+      const data = await boardFetch(`/api/board/review/${askId}/asker-confirm-vote`, {
+        body: JSON.stringify({ vote, voter: acVoter }),
+        method: "POST",
+      });
+      setNotice(
+        data.askerConfirmStatus === "verified"
+          ? "Three agreed — that ask is now met, and the tally moved."
+          : data.askerConfirmStatus === "rejected"
+            ? "Rejected — the asker can send a corrected number."
+            : "Vote recorded.",
+      );
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not record the vote.");
+    }
+  }
+
+  // Forgot-password decisions (Nov 17, 2026): approve lets that same
+  // device set a new password within 7 days.
+  async function resetDecision(id: number, decision: "approve" | "reject") {
+    setError(null);
+    try {
+      await boardFetch(`/api/board/review/password-reset/${id}/decision`, {
+        body: JSON.stringify({ decision }),
+        method: "POST",
+      });
+      setNotice(
+        decision === "approve"
+          ? "Approved — that device can now set a new password."
+          : "Rejected — the asker can request again.",
+      );
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not record the decision.");
     }
   }
 
@@ -1297,6 +1738,112 @@ function ReviewView() {
           </div>
         </div>
       ))}
+      <div className="card">
+        <h2>Claimed asks</h2>
+        <p>
+          What&rsquo;s claimed and waiting on proof right now — no digging
+          into the database. No giver details are shown here.
+        </p>
+        {!lockedAsks ? (
+          <p>Load the queue above to see claimed asks.</p>
+        ) : lockedAsks.length === 0 ? (
+          <p>Nothing claimed right now.</p>
+        ) : (
+          lockedAsks.map((ask) => (
+            <div key={ask.id} style={{ borderTop: "1px solid #e5dcc8", paddingTop: ".5rem" }}>
+              <p>
+                <strong>{ask.payee}</strong> — {money(ask.amount)} — {ask.category} — {ask.state}
+              </p>
+              <p>
+                {ask.hasProof
+                  ? "Proof sent — waiting for the asker to confirm it cleared."
+                  : `Waiting for proof — ${timeLeft(ask.claimExpiresAt)}.`}
+                {ask.askerConfirmStatus === "pending" &&
+                  " The asker sent a confirmation number — see below."}
+              </p>
+            </div>
+          ))
+        )}
+      </div>
+      <div className="card">
+        <h2>Asker confirmations</h2>
+        <p>
+          The giver paid but never sent proof, so the asker sent the
+          confirmation number from their own bill. Three of the four board
+          members agreeing the amount matches makes the ask met; any
+          rejection turns it down.
+        </p>
+        {!askerConfirms ? (
+          <p>Load the queue above to see them.</p>
+        ) : askerConfirms.length === 0 ? (
+          <div className="card empty">Nothing waiting for the board.</div>
+        ) : (
+          askerConfirms.map((ask) => (
+            <div className="card" key={ask.id}>
+              <div className="ask-head">
+                <h3>{ask.payee}</h3>
+                <span className="amount">{money(ask.amount)}</span>
+              </div>
+              <p className="meta">{ask.category} — {ask.state}</p>
+              <p>
+                Asker&rsquo;s confirmation number:{" "}
+                <code>{ask.askerConfirmation}</code>
+              </p>
+              <p>
+                Votes:{" "}
+                {ask.votes.length === 0
+                  ? "none yet"
+                  : ask.votes.map((v) => `${v.voter}: ${v.vote}`).join(", ")}
+              </p>
+              <label>
+                Voting as
+                <select value={acVoter} onChange={(e) => setAcVoter(e.target.value)}>
+                  <option value="darin">Darin</option>
+                  <option value="maya">Maya</option>
+                  <option value="milo">Milo</option>
+                  <option value="jason">Jason</option>
+                </select>
+              </label>
+              <div className="btn-row">
+                <button className="btn" onClick={() => acVote(ask.id, "approve")}>
+                  Approve
+                </button>
+                <button className="btn secondary" onClick={() => acVote(ask.id, "reject")}>
+                  Reject
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+      <div className="card">
+        <h2>Password reset requests</h2>
+        <p>
+          Askers who forgot their password ask the board here. Approve and
+          that same device can set a new password within 7 days.
+        </p>
+        {!passwordResets ? (
+          <p>Load the queue above to see them.</p>
+        ) : passwordResets.length === 0 ? (
+          <div className="card empty">No reset requests waiting.</div>
+        ) : (
+          passwordResets.map((r) => (
+            <div key={r.id} style={{ borderTop: "1px solid #e5dcc8", paddingTop: ".5rem" }}>
+              <p>
+                Handle: <strong>{r.handle}</strong>
+              </p>
+              <div className="btn-row">
+                <button className="btn" onClick={() => resetDecision(r.id, "approve")}>
+                  Approve
+                </button>
+                <button className="btn secondary" onClick={() => resetDecision(r.id, "reject")}>
+                  Reject
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
       <div className="card">
         <h2>Remove an ask</h2>
         <p>
@@ -1416,7 +1963,10 @@ function HowView() {
         </li>
         <li>
           Askers sign in with just a handle and a password. No real names or
-          addresses are stored anywhere.
+          addresses are stored anywhere. Forgot your password? There&rsquo;s
+          no email on file to send a reset to — ask the board from the
+          sign-in page, and once they approve it you can set a new one on
+          the same device.
         </li>
       </ul>
       <h3>Why this version is out now</h3>
@@ -1461,12 +2011,24 @@ function App() {
   const [view, setView] = useState<View>("board");
   const [me, setMe] = useState<MeData | null>(null);
   const [boardTick, setBoardTick] = useState(0);
+  // Forced password change (Nov 17, 2026): a board-issued temp password
+  // must be changed before anything else, even after a reload.
+  const [mustChange, setMustChange] = useState(false);
 
   useEffect(() => {
     if (!getAuthToken()) return;
     fetchJSON("/api/accounts/me")
       .then((data) => setMe(data))
-      .catch(() => {
+      .catch(async () => {
+        try {
+          const status = await fetchJSON("/api/accounts/password-status");
+          if (status.mustChangePassword) {
+            setMustChange(true);
+            return;
+          }
+        } catch {
+          // fall through
+        }
         setAuthToken(null);
         setMe(null);
       });
@@ -1480,6 +2042,39 @@ function App() {
     }
     setAuthToken(null);
     setMe(null);
+    setMustChange(false);
+  }
+
+  async function afterPasswordChanged() {
+    setMustChange(false);
+    try {
+      const data = await fetchJSON("/api/accounts/me");
+      setMe(data);
+    } catch {
+      setAuthToken(null);
+      setMe(null);
+    }
+  }
+
+  if (mustChange) {
+    return (
+      <div>
+        <header>
+          <div className="wrap">
+            <h1>A Hand Up</h1>
+            <p>Small bills. Paid directly. No cash ever touches the asker.</p>
+          </div>
+        </header>
+        <main>
+          <ChangePasswordForm forced onDone={afterPasswordChanged} />
+          <p style={{ textAlign: "center" }}>
+            <button className="btn secondary" onClick={signOut}>
+              Sign out instead
+            </button>
+          </p>
+        </main>
+      </div>
+    );
   }
 
   return (
@@ -1543,7 +2138,13 @@ function App() {
             onClaimed={() => setBoardTick((t) => t + 1)}
           />
         )}
-        {view === "ask" && <AskView me={me} onAuthed={setMe} />}
+        {view === "ask" && (
+          <AskView
+            me={me}
+            onAuthed={setMe}
+            onMustChange={() => setMustChange(true)}
+          />
+        )}
         {view === "yours" && <YoursView me={me} />}
         {view === "how" && <HowView />}
         {view === "review" && <ReviewView />}

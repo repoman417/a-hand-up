@@ -2,7 +2,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { db, UPLOAD_DIR } from "./db";
-import { accounts, asks, needVotes, sessions } from "./schema";
+import { accounts, askerConfirmVotes, asks, needVotes, passwordResets, sessions } from "./schema";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -22,6 +22,13 @@ const PROOF_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 // endpoints stay closed — the board cannot vote until it is set.
 const BOARD_TOKEN = process.env.BOARD_TOKEN || "";
 const BOARD_VOTERS = ["darin", "maya", "milo"] as const;
+// Asker-confirm votes (Nov 17, 2026): the board is now four, and the
+// standing rule is 3 of 4 — three distinct approvals verify, any
+// rejection rejects. (Verified-need votes above still use the original
+// three voters; aligning those to four is a separate board decision.)
+const BOARD_VOTERS4 = ["darin", "maya", "milo", "jason"] as const;
+// A board-approved forgot-password reset can be completed for 7 days.
+const PASSWORD_RESET_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB
 const UPLOAD_TYPES: Record<string, string> = {
   ".gif": "image/gif",
@@ -116,7 +123,11 @@ function deviceToken(req: Request): string | null {
   return h && h.trim() ? h.trim() : null;
 }
 
-async function authedAccount(req: Request) {
+// Raw session lookup — the account behind a bearer token, whatever its
+// password state. Used by the password-change and password-status
+// endpoints, which must work for an account that is forced to change its
+// password (authedAccount below refuses those).
+async function sessionAccount(req: Request) {
   const token = bearerToken(req);
   if (!token) return null;
   const [session] = await db
@@ -131,6 +142,23 @@ async function authedAccount(req: Request) {
     .where(eq(accounts.id, session.accountId))
     .limit(1);
   return account ?? null;
+}
+
+async function authedAccount(req: Request) {
+  const account = await sessionAccount(req);
+  // An account holding a board-issued temp password must change it
+  // before it can do anything else (board vote Nov 17, 2026). Every
+  // authed route goes through here, so the forced-change flow is
+  // enforced server-side, not just in the client.
+  if (account && account.mustChangePassword === 1) return null;
+  return account;
+}
+
+// One-time temp password for a board reset: 12 hex characters, handed
+// to the asker directly (e.g. on Messenger) — never emailed, never
+// shown on the site.
+function genTempPassword(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 }
 
 function boardToken(req: Request): string | null {
@@ -157,6 +185,9 @@ async function releaseStaleClaims(): Promise<void> {
   await db
     .update(asks)
     .set({
+      askerConfirmation: null,
+      askerConfirmStatus: "none",
+      askerConfirmSubmittedAt: null,
       claimedAt: null,
       claimedByDevice: null,
       proofConfirmation: null,
@@ -174,6 +205,9 @@ async function releaseStaleClaims(): Promise<void> {
   await db
     .update(asks)
     .set({
+      askerConfirmation: null,
+      askerConfirmStatus: "none",
+      askerConfirmSubmittedAt: null,
       claimedAt: null,
       claimedByDevice: null,
       proofConfirmation: null,
@@ -289,7 +323,16 @@ function ownAsk(row: typeof asks.$inferSelect) {
   return {
     accountNumber: row.accountNumber,
     amount: dollars(row.amountCents),
+    askerConfirmation: row.askerConfirmation,
+    askerConfirmStatus: row.askerConfirmStatus,
+    askerConfirmSubmittedAt: row.askerConfirmSubmittedAt,
     category: row.category,
+    // When a locked ask's claim runs out (24h with no proof).
+    claimExpiresAt:
+      row.status === "locked" && row.claimedAt
+        ? row.claimedAt + CLAIM_PROOF_WINDOW_MS
+        : null,
+    claimedAt: row.claimedAt,
     createdAt: row.createdAt,
     cutoffDate: row.cutoffDate,
     dueDate: row.dueDate,
@@ -463,8 +506,29 @@ async function handle(req: Request): Promise<Response> {
       .where(sql`lower(${accounts.handle}) = ${handle.toLowerCase()}`)
       .limit(1);
     if (!account) return err("Wrong handle or password.", 401);
+    // A board-issued temp password expires after 24 hours, or after its
+    // first use — whichever comes first (board vote Nov 17, 2026).
+    if (
+      account.tempPasswordExpiresAt != null &&
+      account.tempPasswordExpiresAt <= now()
+    ) {
+      return err(
+        "That temporary password has expired — ask the board for a new one.",
+        401,
+      );
+    }
     const ok = await Bun.password.verify(password, account.passwordHash);
     if (!ok) return err("Wrong handle or password.", 401);
+    if (account.tempPasswordExpiresAt != null) {
+      // First login with the temp password consumes it: the expiry is
+      // set to now, so it can never log in a second time. The asker
+      // must now change it (mustChangePassword) before doing anything
+      // else — see authedAccount.
+      await db
+        .update(accounts)
+        .set({ tempPasswordExpiresAt: now() })
+        .where(eq(accounts.id, account.id));
+    }
     const token = crypto.randomUUID();
     await db
       .insert(sessions)
@@ -472,6 +536,7 @@ async function handle(req: Request): Promise<Response> {
     return json({
       handle: account.handle,
       internalNumber: account.internalNumber,
+      mustChangePassword: account.mustChangePassword === 1,
       token,
     });
   }
@@ -498,6 +563,178 @@ async function handle(req: Request): Promise<Response> {
       internalNumber: account.internalNumber,
       remainingCents: CAP_CENTS - used,
       usedCents: used,
+    });
+  }
+
+  // Change password while signed in (board vote Nov 17, 2026): no old
+  // password is needed — the signed-in session IS the proof. Scoped to
+  // the signed-in account only. Other sessions for the account are
+  // dropped; this one stays, so the user is not signed out mid-change.
+  // This is also the forced-change endpoint: it works for an account
+  // holding a board-issued temp password, which is exactly the point.
+  if (method === "POST" && path === "/api/accounts/change-password") {
+    const account = await sessionAccount(req);
+    if (!account) return err("Sign in first.", 401);
+    const body = await parseBody(req);
+    const newPassword =
+      typeof body.newPassword === "string" ? body.newPassword : "";
+    if (newPassword.length < 6) {
+      return err("New password needs at least 6 characters.");
+    }
+    const passwordHash = await Bun.password.hash(newPassword, {
+      algorithm: "bcrypt",
+      cost: 10,
+    });
+    await db
+      .update(accounts)
+      .set({ mustChangePassword: 0, passwordHash, tempPasswordExpiresAt: null })
+      .where(eq(accounts.id, account.id));
+    const token = bearerToken(req);
+    if (token) {
+      await db
+        .delete(sessions)
+        .where(
+          and(
+            eq(sessions.accountId, account.id),
+            sql`${sessions.token} != ${token}`,
+          ),
+        );
+    }
+    return json({ ok: true });
+  }
+
+  // Whether the signed-in account must change its password before doing
+  // anything else (board-issued temp password). The client checks this
+  // on load so a reloaded forced-change session shows the change form.
+  if (method === "GET" && path === "/api/accounts/password-status") {
+    const account = await sessionAccount(req);
+    if (!account) return err("Sign in first.", 401);
+    return json({ mustChangePassword: account.mustChangePassword === 1 });
+  }
+
+  // Forgot password, no email (board vote Nov 17, 2026): the request is
+  // tied to the browser/device that made it — the X-Device-Token the
+  // client already sends with every request (a UUID kept in
+  // localStorage). No email field exists and none is added. The board
+  // approves the request, then that same device can set a new password.
+  // Clearing localStorage or switching browsers makes a new device, so
+  // the request would need to be made again from the new one — that is
+  // the trade-off for having no email on file.
+  if (method === "POST" && path === "/api/accounts/forgot-password") {
+    const device = deviceToken(req);
+    if (!device) return err("This device could not be identified.", 400);
+    const body = await parseBody(req);
+    const handle =
+      typeof body.handle === "string" ? body.handle.trim() : "";
+    const [account] = await db
+      .select()
+      .from(accounts)
+      .where(sql`lower(${accounts.handle}) = ${handle.toLowerCase()}`)
+      .limit(1);
+    // Generic answer either way — the response never says whether the
+    // handle exists, so handles cannot be probed.
+    if (!account) return json({ ok: true });
+    const [pending] = await db
+      .select()
+      .from(passwordResets)
+      .where(
+        and(
+          eq(passwordResets.accountId, account.id),
+          eq(passwordResets.status, "pending"),
+        ),
+      )
+      .limit(1);
+    if (pending) {
+      return err(
+        "A reset request for this handle is already waiting for the board.",
+        409,
+      );
+    }
+    await db.insert(passwordResets).values({
+      accountId: account.id,
+      createdAt: now(),
+      deviceToken: device,
+      status: "pending",
+    });
+    return json({ ok: true });
+  }
+
+  // Complete a board-approved forgot-password reset. Only the device
+  // that made the request can do it, and only while the approval is
+  // fresh (7 days). The old password stops working everywhere.
+  if (method === "POST" && path === "/api/accounts/reset-password") {
+    const device = deviceToken(req);
+    if (!device) return err("This device could not be identified.", 400);
+    const body = await parseBody(req);
+    const handle =
+      typeof body.handle === "string" ? body.handle.trim() : "";
+    const newPassword =
+      typeof body.newPassword === "string" ? body.newPassword : "";
+    if (newPassword.length < 6) {
+      return err("New password needs at least 6 characters.");
+    }
+    const [account] = await db
+      .select()
+      .from(accounts)
+      .where(sql`lower(${accounts.handle}) = ${handle.toLowerCase()}`)
+      .limit(1);
+    if (!account) {
+      return err(
+        "No approved reset for this device — request one first, and wait for the board to approve it.",
+        403,
+      );
+    }
+    const [reset] = await db
+      .select()
+      .from(passwordResets)
+      .where(
+        and(
+          eq(passwordResets.accountId, account.id),
+          eq(passwordResets.deviceToken, device),
+          eq(passwordResets.status, "approved"),
+        ),
+      )
+      .orderBy(desc(passwordResets.decidedAt))
+      .limit(1);
+    if (!reset) {
+      return err(
+        "No approved reset for this device — request one first, and wait for the board to approve it.",
+        403,
+      );
+    }
+    if (
+      reset.decidedAt != null &&
+      reset.decidedAt < now() - PASSWORD_RESET_WINDOW_MS
+    ) {
+      return err("That reset approval has expired — request a new one.", 410);
+    }
+    const passwordHash = await Bun.password.hash(newPassword, {
+      algorithm: "bcrypt",
+      cost: 10,
+    });
+    await db.transaction(async (tx) => {
+      await tx
+        .update(accounts)
+        .set({
+          mustChangePassword: 0,
+          passwordHash,
+          tempPasswordExpiresAt: null,
+        })
+        .where(eq(accounts.id, account.id));
+      await tx
+        .update(passwordResets)
+        .set({ status: "used" })
+        .where(eq(passwordResets.id, reset.id));
+      await tx.delete(sessions).where(eq(sessions.accountId, account.id));
+    });
+    const token = crypto.randomUUID();
+    await db
+      .insert(sessions)
+      .values({ accountId: account.id, createdAt: now(), token });
+    return json({
+      handle: account.handle,
+      internalNumber: account.internalNumber,
+      token,
     });
   }
 
@@ -677,7 +914,7 @@ async function handle(req: Request): Promise<Response> {
     return json({ asks: rows.map(ownAsk) });
   }
 
-  const askIdMatch = path.match(/^\/api\/asks\/(\d+)\/(withdraw|claim|submit-proof|confirm-paid|reject-proof|release)$/);
+  const askIdMatch = path.match(/^\/api\/asks\/(\d+)\/(withdraw|claim|submit-proof|confirm-paid|asker-confirm|reject-proof|release)$/);
   if (askIdMatch) {
     const askId = Number(askIdMatch[1]);
     const action = askIdMatch[2];
@@ -886,6 +1123,69 @@ async function handle(req: Request): Promise<Response> {
       return json({ ok: true });
     }
 
+    // Asker-confirm fallback (board vote Nov 17, 2026): the giver paid
+    // but never uploaded proof. The asker confirms with the confirmation
+    // number from their own bill. This does NOT mark the ask met on its
+    // own — the board verifies the amount matches first (see the review
+    // queue). The normal flow is unchanged: confirm-paid still needs
+    // the giver's proof.
+    if (method === "POST" && action === "asker-confirm") {
+      const account = await authedAccount(req);
+      if (!account) return err("Sign in first.", 401);
+      const [row] = await db
+        .select()
+        .from(asks)
+        .where(eq(asks.id, askId))
+        .limit(1);
+      if (!row) return err("Ask not found.", 404);
+      if (row.accountId !== account.id) {
+        return err("That is not your ask.", 403);
+      }
+      if (row.status !== "locked" || row.proofConfirmation) {
+        return err(
+          "There is no unconfirmed payment to report — either the giver has not paid yet, or their proof is already in.",
+          409,
+        );
+      }
+      if (row.askerConfirmStatus === "pending") {
+        return err(
+          "That confirmation number is already waiting for the board to check.",
+          409,
+        );
+      }
+      const body = await parseBody(req);
+      const confirmation =
+        typeof body.confirmation === "string"
+          ? body.confirmation.trim()
+          : "";
+      if (
+        !confirmation ||
+        confirmation.length < 3 ||
+        confirmation.length > 64
+      ) {
+        return err(
+          "Add the payment confirmation number from your bill — the board checks it before the ask counts as met.",
+          400,
+        );
+      }
+      // A rejected number can be re-submitted with a corrected one; the
+      // board votes on the rejected attempt are cleared.
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(askerConfirmVotes)
+          .where(eq(askerConfirmVotes.askId, askId));
+        await tx
+          .update(asks)
+          .set({
+            askerConfirmation: confirmation,
+            askerConfirmStatus: "pending",
+            askerConfirmSubmittedAt: now(),
+          })
+          .where(eq(asks.id, askId));
+      });
+      return json({ ok: true });
+    }
+
     // The asker says the proof did not clear with the payee: the ask
     // goes back on the board for someone else, and the proof is cleared.
     if (method === "POST" && action === "reject-proof") {
@@ -961,6 +1261,12 @@ async function handle(req: Request): Promise<Response> {
         accountNumber: row.status === "locked" ? row.accountNumber : null,
         amount: dollars(row.amountCents),
         category: row.category,
+        // When a locked ask's claim runs out (24h with no proof).
+        claimExpiresAt:
+          row.status === "locked" && row.claimedAt
+            ? row.claimedAt + CLAIM_PROOF_WINDOW_MS
+            : null,
+        claimedAt: row.claimedAt,
         cutoffDate: row.cutoffDate,
         dueDate: row.dueDate,
         hasReceipt: !!row.proofReceiptPath,
@@ -1063,7 +1369,56 @@ async function handle(req: Request): Promise<Response> {
         votes: votes.map((v) => ({ vote: v.vote, voter: v.voter })),
       });
     }
-    return json({ asks: out });
+    // Asker-confirms awaiting board verification (Nov 17, 2026): the
+    // giver paid but never uploaded proof, so the asker supplied the
+    // confirmation number from their own bill. The board checks the
+    // amount matches before the ask counts as met.
+    const confirmRows = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.askerConfirmStatus, "pending"))
+      .orderBy(desc(asks.askerConfirmSubmittedAt));
+    const askerConfirms = [];
+    for (const row of confirmRows) {
+      const votes = await db
+        .select()
+        .from(askerConfirmVotes)
+        .where(eq(askerConfirmVotes.askId, row.id));
+      askerConfirms.push({
+        amount: dollars(row.amountCents),
+        askerConfirmation: row.askerConfirmation,
+        askerConfirmSubmittedAt: row.askerConfirmSubmittedAt,
+        category: row.category,
+        createdAt: row.createdAt,
+        id: row.id,
+        payee: row.payee,
+        state: row.state,
+        votes: votes.map((v) => ({ vote: v.vote, voter: v.voter })),
+      });
+    }
+    // Forgot-password requests awaiting a board decision (Nov 17, 2026).
+    // Handles show here because the board needs to know whose request
+    // it is — this endpoint is board-gated, and handles never appear
+    // anywhere public.
+    const resetRows = await db
+      .select()
+      .from(passwordResets)
+      .where(eq(passwordResets.status, "pending"))
+      .orderBy(desc(passwordResets.createdAt));
+    const passwordResetsOut = [];
+    for (const r of resetRows) {
+      const [acct] = await db
+        .select()
+        .from(accounts)
+        .where(eq(accounts.id, r.accountId))
+        .limit(1);
+      passwordResetsOut.push({
+        createdAt: r.createdAt,
+        handle: acct?.handle ?? "?",
+        id: r.id,
+      });
+    }
+    return json({ asks: out, askerConfirms, passwordResets: passwordResetsOut });
   }
 
   const voteMatch = path.match(/^\/api\/board\/review\/(\d+)\/vote$/);
@@ -1125,6 +1480,97 @@ async function handle(req: Request): Promise<Response> {
     });
   }
 
+  // Board vote on an asker-confirm (Nov 17, 2026): the giver paid but
+  // never uploaded proof, so the asker supplied the confirmation number
+  // from their own bill. Three of four board members verifying the
+  // amount matches makes the ask met and moves the tally; any rejection
+  // rejects it, and the asker can re-submit a corrected number.
+  const acVoteMatch = path.match(/^\/api\/board\/review\/(\d+)\/asker-confirm-vote$/);
+  if (method === "POST" && acVoteMatch) {
+    const denied = requireBoard(req);
+    if (denied) return denied;
+    const askId = Number(acVoteMatch[1]);
+    const body = await parseBody(req);
+    const voter = typeof body.voter === "string" ? body.voter : "";
+    const vote = typeof body.vote === "string" ? body.vote : "";
+    if (!(BOARD_VOTERS4 as readonly string[]).includes(voter)) {
+      return err("Voter must be darin, maya, milo, or jason.", 400);
+    }
+    if (vote !== "approve" && vote !== "reject") {
+      return err("Vote must be approve or reject.", 400);
+    }
+    const [row] = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.id, askId))
+      .limit(1);
+    if (!row) return err("Ask not found.", 404);
+    if (row.askerConfirmStatus !== "pending") {
+      return err("This confirmation is no longer awaiting review.", 409);
+    }
+    await db
+      .insert(askerConfirmVotes)
+      .values({ askId, createdAt: now(), vote, voter })
+      .onConflictDoUpdate({
+        set: { createdAt: now(), vote },
+        target: [askerConfirmVotes.askId, askerConfirmVotes.voter],
+      });
+    const votes = await db
+      .select()
+      .from(askerConfirmVotes)
+      .where(eq(askerConfirmVotes.askId, askId));
+    const approvals = votes.filter((v) => v.vote === "approve").length;
+    const rejections = votes.filter((v) => v.vote === "reject").length;
+    let status = "pending";
+    if (rejections > 0) {
+      status = "rejected";
+      await db
+        .update(asks)
+        .set({ askerConfirmStatus: "rejected" })
+        .where(eq(asks.id, askId));
+    } else if (approvals >= 3) {
+      status = "verified";
+      await db
+        .update(asks)
+        .set({ askerConfirmStatus: "verified", metAt: now(), status: "met" })
+        .where(eq(asks.id, askId));
+    }
+    return json({
+      askerConfirmStatus: status,
+      votes: votes.map((v) => ({ vote: v.vote, voter: v.voter })),
+    });
+  }
+
+  // Board decision on a forgot-password request (Nov 17, 2026). Approve
+  // lets that same device set a new password within 7 days; reject
+  // closes the request and the asker can ask again.
+  const resetDecisionMatch = path.match(/^\/api\/board\/review\/password-reset\/(\d+)\/decision$/);
+  if (method === "POST" && resetDecisionMatch) {
+    const denied = requireBoard(req);
+    if (denied) return denied;
+    const resetId = Number(resetDecisionMatch[1]);
+    const body = await parseBody(req);
+    const decision = typeof body.decision === "string" ? body.decision : "";
+    if (decision !== "approve" && decision !== "reject") {
+      return err("Decision must be approve or reject.", 400);
+    }
+    const [reset] = await db
+      .select()
+      .from(passwordResets)
+      .where(eq(passwordResets.id, resetId))
+      .limit(1);
+    if (!reset) return err("Reset request not found.", 404);
+    if (reset.status !== "pending") {
+      return err("This request has already been decided.", 409);
+    }
+    const status = decision === "approve" ? "approved" : "rejected";
+    await db
+      .update(passwordResets)
+      .set({ decidedAt: now(), status })
+      .where(eq(passwordResets.id, resetId));
+    return json({ ok: true, status });
+  }
+
   // Board removal (Nov 13, 2026): when all three board members agree an
   // ask should come down, the board removes it with a reason. The reason
   // is stored on the ask and shown to the asker on their own page next
@@ -1173,6 +1619,82 @@ async function handle(req: Request): Promise<Response> {
       .where(eq(asks.id, askId));
     return json({
       ask: ownAsk({ ...row, removedAt, removedReason: reason, status: "removed" }),
+    });
+  }
+
+  // Board-only password reset (board vote Nov 17, 2026, unanimous):
+  // the board issues a one-time temp password for a handle. It expires
+  // after first login or 24 hours, and the asker must change it on
+  // first login. The temp password is returned to the board caller
+  // only, so Maya/Darin can hand it to the asker directly (e.g. Jason,
+  // handle casper26, on Messenger). Existing sessions die, so the old
+  // password cannot keep working anywhere. The board token is the only
+  // gate — no single member can reset alone because only the board
+  // holds the token.
+  if (method === "POST" && path === "/api/board/reset-password") {
+    const denied = requireBoard(req);
+    if (denied) return denied;
+    const body = await parseBody(req);
+    const handle =
+      typeof body.handle === "string" ? body.handle.trim() : "";
+    const [account] = await db
+      .select()
+      .from(accounts)
+      .where(sql`lower(${accounts.handle}) = ${handle.toLowerCase()}`)
+      .limit(1);
+    if (!account) return err("No account with that handle.", 404);
+    const tempPassword = genTempPassword();
+    const passwordHash = await Bun.password.hash(tempPassword, {
+      algorithm: "bcrypt",
+      cost: 10,
+    });
+    const expiresAt = now() + 24 * 60 * 60 * 1000;
+    await db.transaction(async (tx) => {
+      await tx
+        .update(accounts)
+        .set({
+          mustChangePassword: 1,
+          passwordHash,
+          tempPasswordExpiresAt: expiresAt,
+        })
+        .where(eq(accounts.id, account.id));
+      await tx.delete(sessions).where(eq(sessions.accountId, account.id));
+    });
+    return json({
+      expiresAt,
+      handle: account.handle,
+      mustChangePassword: true,
+      tempPassword,
+    });
+  }
+
+  // Board-only locked-asks view (board vote Nov 17, 2026, unanimous):
+  // what is claimed and waiting on proof, without digging into the
+  // database. No giver details — no account number, no handle, no
+  // device token, no confirmation number, no gift-card code.
+  if (method === "GET" && path === "/api/board/locked") {
+    const denied = requireBoard(req);
+    if (denied) return denied;
+    await releaseStaleClaims();
+    const rows = await db
+      .select()
+      .from(asks)
+      .where(eq(asks.status, "locked"))
+      .orderBy(desc(asks.claimedAt));
+    return json({
+      asks: rows.map((row) => ({
+        amount: dollars(row.amountCents),
+        askerConfirmStatus: row.askerConfirmStatus,
+        category: row.category,
+        claimExpiresAt:
+          row.claimedAt ? row.claimedAt + CLAIM_PROOF_WINDOW_MS : null,
+        claimedAt: row.claimedAt,
+        hasProof: !!row.proofConfirmation,
+        id: row.id,
+        payee: row.payee,
+        proofSubmittedAt: row.proofSubmittedAt,
+        state: row.state,
+      })),
     });
   }
 

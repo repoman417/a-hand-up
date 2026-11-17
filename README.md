@@ -39,6 +39,7 @@ bun run dev
 |---|---|---|
 | `PORT` | `3000` | Port the server listens on. Render sets this itself. |
 | `DATABASE_PATH` | `./data/app.db` | Where the SQLite file lives. On Render, point it at the persistent disk (`/var/data/app.db` — see `render.yaml`). |
+| `BOARD_TOKEN` | (none) | Shared secret for the board review endpoints (`x-board-token`). Without it the board queue, locked-asks view, password resets, and ask removal stay closed. |
 
 The database file is created automatically on first boot, including all
 tables. No migration step.
